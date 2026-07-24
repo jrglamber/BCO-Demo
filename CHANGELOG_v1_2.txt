@@ -1,0 +1,13 @@
+BCO Demo v1.2 / app v10.0.99
+
+- GBP dashboard display via DISPLAY_CURRENCY=GBP
+- BCO-only headline scope: BCOUSD / OIL_BASKET
+- Signal coverage defaults to 1 expected BCO signal
+- Candidate support defaults to 1 BCO asset
+- BCO broker P&L/high-water/giveback use actual practice-account UPL
+- Broker-confirmed filtering extended to OIL_BASKET
+- Managed stop and staged basket-manager mechanics retained
+- 40/60/75/100R harvest ladder generalized to OIL_BASKET and enabled in demo vars
+- /broker/oanda/safety route added
+- Non-BCO dashboard research panels hidden
+- DB_PATH defaults to /data/bco_demo.sqlite
