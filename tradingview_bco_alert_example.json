@@ -1,0 +1,17 @@
+{
+  "secret": "REPLACE_WITH_BCO_WEBHOOK_SECRET",
+  "source": "tradingview_bco_1h_8h",
+  "pair": "BCOUSD",
+  "signal_id": "BCOUSD_{{time}}_1H_8H",
+  "timestamp": "{{time}}",
+  "timeframe": "1H",
+  "execution_tf": "1H",
+  "context_tf": "8H",
+  "signal_side": "long",
+  "exec_close": "{{close}}",
+  "exec_high": "{{high}}",
+  "exec_low": "{{low}}",
+  "forward_test_candidate": "REPLACE_WITH_INDICATOR_BOOLEAN",
+  "rule_trend_long_v1": "REPLACE_WITH_INDICATOR_BOOLEAN",
+  "model_version": "BCO_1H_8H_TREND_LONG_V1"
+}
