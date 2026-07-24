@@ -23,9 +23,23 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "Project Exit Plan Dashboard - v10.0.98 - BCO 1H/8H Demo Forward Test"
+APP_NAME = "BCO Demo Dashboard - v10.0.99 - Project Exit Plan Mirror"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-DB_PATH = os.getenv("DB_PATH", "/data/trading_bot.sqlite")
+DB_PATH = os.getenv("DB_PATH", "/data/bco_demo.sqlite")
+BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
+DISPLAY_CURRENCY = os.getenv("DISPLAY_CURRENCY", "GBP").strip().upper()
+DASHBOARD_SCOPE_ASSETS = [
+    x.strip().upper()
+    for x in os.getenv("DASHBOARD_SCOPE_ASSETS", "BCOUSD").split(",")
+    if x.strip()
+]
+DASHBOARD_SCOPE_FAMILY = os.getenv("DASHBOARD_SCOPE_FAMILY", "OIL_BASKET").strip().upper()
+DASHBOARD_SCOPE_LABEL = os.getenv("DASHBOARD_SCOPE_LABEL", "BCO").strip() or "BCO"
+DASHBOARD_TITLE = os.getenv("DASHBOARD_TITLE", "BCO Demo Dashboard").strip() or "BCO Demo Dashboard"
+DASHBOARD_SUBTITLE = os.getenv(
+    "DASHBOARD_SUBTITLE",
+    "Project Exit Plan mirror — BCO 1H/8H practice-account forward test",
+).strip()
 SQLITE_TIMEOUT_SECONDS = float(os.getenv("SQLITE_TIMEOUT_SECONDS", "45"))
 SQLITE_BUSY_TIMEOUT_MS = int(float(os.getenv("SQLITE_BUSY_TIMEOUT_MS", str(int(SQLITE_TIMEOUT_SECONDS * 1000)))) )
 
@@ -345,7 +359,7 @@ BROKER_MAX_RISK_TEST_AMOUNT = float(os.getenv("BROKER_MAX_RISK_TEST_AMOUNT", "50
 BROKER_DEFAULT_RISK_TEST_AMOUNT = float(os.getenv("BROKER_DEFAULT_RISK_TEST_AMOUNT", "50"))
 BROKER_DEFAULT_SL_PCT = float(os.getenv("BROKER_DEFAULT_SL_PCT", "1.5"))
 BROKER_ALLOWED_INSTRUMENTS = {
-    x.strip() for x in os.getenv("BROKER_ALLOWED_INSTRUMENTS", "SPX500_USD,NAS100_USD").split(",") if x.strip()
+    x.strip() for x in os.getenv("BROKER_ALLOWED_INSTRUMENTS", "BCO_USD").split(",") if x.strip()
 }
 
 # ============================================================
@@ -358,7 +372,7 @@ BROKER_ALLOWED_INSTRUMENTS = {
 # - Keep Nikkei marked as demo/test research, not live-approved.
 # - Create shadow/demo-managed LONG candidate=true rows only.
 # - Do NOT broker-promote Nikkei while NAS100/US500 remain live-money assets.
-NIKKEI_DEMO_ENABLED = os.getenv("NIKKEI_DEMO_ENABLED", "true").strip().lower() == "true"
+NIKKEI_DEMO_ENABLED = os.getenv("NIKKEI_DEMO_ENABLED", "false").strip().lower() == "true"
 NIKKEI_DEMO_INSTRUMENT = os.getenv("OANDA_NIKKEI_INSTRUMENT", os.getenv("OANDA_JP225_INSTRUMENT", "JP225_USD")).strip().upper()
 NIKKEI_DEMO_SL_PCT = float(os.getenv("NIKKEI_DEMO_SL_PCT", "2.0"))
 NIKKEI_DEMO_DIRECTION = os.getenv("NIKKEI_DEMO_DIRECTION", "long").strip().lower()
@@ -400,7 +414,7 @@ if BCO_DEMO_ENABLED and BCO_BROKER_EXECUTION_ENABLED:
 BROKER_SHADOW_AUTO_EXECUTION_ENABLED = os.getenv("BROKER_SHADOW_AUTO_EXECUTION_ENABLED", "false").strip().lower() == "true"
 BROKER_SHADOW_AUTO_CLOSE_ENABLED = os.getenv("BROKER_SHADOW_AUTO_CLOSE_ENABLED", "true").strip().lower() == "true"
 BROKER_SHADOW_AUTO_ALLOWED_ASSETS = {
-    x.strip().upper() for x in os.getenv("BROKER_SHADOW_AUTO_ALLOWED_ASSETS", "NAS100,US500").split(",") if x.strip()
+    x.strip().upper() for x in os.getenv("BROKER_SHADOW_AUTO_ALLOWED_ASSETS", "BCOUSD").split(",") if x.strip()
 }
 BROKER_SHADOW_AUTO_RISK_AMOUNT = float(os.getenv("BROKER_SHADOW_AUTO_RISK_AMOUNT", str(BROKER_DEFAULT_RISK_TEST_AMOUNT)))
 BROKER_SHADOW_AUTO_SL_PCT = float(os.getenv("BROKER_SHADOW_AUTO_SL_PCT", str(BROKER_DEFAULT_SL_PCT)))
@@ -460,7 +474,7 @@ WEBHOOK_SIGNAL_WORKER_SLEEP_SECONDS = max(0.05, min(float(os.getenv("WEBHOOK_SIG
 BROKER_LATEST_SIGNAL_RECONCILE_ENABLED = os.getenv("BROKER_LATEST_SIGNAL_RECONCILE_ENABLED", "true").strip().lower() == "true"
 BROKER_LATEST_SIGNAL_RECONCILE_MAX_AGE_SECONDS = int(float(os.getenv("BROKER_LATEST_SIGNAL_RECONCILE_MAX_AGE_SECONDS", "7200")))
 BROKER_LATEST_SIGNAL_RECONCILE_ASSETS = {
-    x.strip().upper() for x in os.getenv("BROKER_LATEST_SIGNAL_RECONCILE_ASSETS", "NAS100,US500").split(",") if x.strip()
+    x.strip().upper() for x in os.getenv("BROKER_LATEST_SIGNAL_RECONCILE_ASSETS", "BCOUSD").split(",") if x.strip()
 }
 
 # v10.0.23 Cost Drag / Execution Quality Guardrails.
@@ -530,7 +544,7 @@ app = FastAPI(title=APP_NAME)
 
 CONFIG = {
     "NAS100": {
-        "enabled": True,
+        "enabled": not BCO_STANDALONE_MODE,
         "direction": "long",
         "sl_pct": 1.5,
         "risk_dollars": BROKER_SHADOW_AUTO_RISK_AMOUNT,
@@ -550,7 +564,7 @@ CONFIG = {
         "allow_down_extension": False,
     },
     "US500": {
-        "enabled": True,
+        "enabled": not BCO_STANDALONE_MODE,
         "direction": "long",
         "sl_pct": 1.5,
         "risk_dollars": BROKER_SHADOW_AUTO_RISK_AMOUNT,
@@ -630,7 +644,7 @@ BASKET_FAMILIES = {
 
 EXPECTED_SIGNAL_PAIRS = [
     x.strip().upper()
-    for x in os.getenv("EXPECTED_SIGNAL_PAIRS", "NAS100,US500,XAUUSD,XAGUSD,BCOUSD").split(",")
+    for x in os.getenv("EXPECTED_SIGNAL_PAIRS", "BCOUSD").split(",")
     if x.strip()
 ]
 
@@ -641,20 +655,20 @@ EXPECTED_SIGNAL_PAIRS = [
 # Metals remain research-only: their signals may continue to be logged and analysed,
 # but they must not enter the broker mirror, index basket P&L, or live accounting.
 JUNE_FULL_DEMO_ENABLED = os.getenv("JUNE_FULL_DEMO_ENABLED", "true").strip().lower() == "true"
-JUNE_FULL_DEMO_NAME = os.getenv("JUNE_FULL_DEMO_NAME", "Live Index Trading v1")
+JUNE_FULL_DEMO_NAME = os.getenv("JUNE_FULL_DEMO_NAME", "BCO Demo Forward Test v1")
 JUNE_FULL_DEMO_BROKER_ASSETS = {
-    x.strip().upper() for x in os.getenv("JUNE_FULL_DEMO_BROKER_ASSETS", "NAS100,US500").split(",") if x.strip()
+    x.strip().upper() for x in os.getenv("JUNE_FULL_DEMO_BROKER_ASSETS", "BCOUSD").split(",") if x.strip()
 }
 JUNE_FULL_DEMO_RESEARCH_ONLY_ASSETS = {
     x.strip().upper() for x in os.getenv(
         "JUNE_FULL_DEMO_RESEARCH_ONLY_ASSETS",
-        "XAUUSD,XAGUSD,XAU,XAG,NIKKEI,JP225,WTI,USOIL,OIL,BCOUSD,BCO,UKOIL,BRENT",
+        "NAS100,US500,XAUUSD,XAGUSD,XAU,XAG,NIKKEI,JP225,JPN225,DAX,GER40,DE40,US30,DOW,WTI,USOIL,OIL",
     ).split(",") if x.strip()
 }
 JUNE_FULL_DEMO_INDEX_SL_PCT = float(os.getenv("JUNE_FULL_DEMO_INDEX_SL_PCT", "1.5"))
 JUNE_FULL_DEMO_LIVE_BALANCE_USD = float(os.getenv("JUNE_FULL_DEMO_LIVE_BALANCE_USD", "10000"))
 JUNE_FULL_DEMO_CLOSE_INSTRUMENTS = {
-    x.strip().upper() for x in os.getenv("JUNE_FULL_DEMO_CLOSE_INSTRUMENTS", "SPX500_USD,NAS100_USD").split(",") if x.strip()
+    x.strip().upper() for x in os.getenv("JUNE_FULL_DEMO_CLOSE_INSTRUMENTS", "BCO_USD").split(",") if x.strip()
 }
 
 if NIKKEI_DEMO_ENABLED and NIKKEI_BROKER_EXECUTION_ENABLED:
@@ -875,17 +889,19 @@ def esc(value: Any) -> str:
 
 
 def account_currency_symbol(currency: str = "") -> str:
-    """Display symbol for the active broker account currency.
+    """Dashboard display symbol.
 
-    OANDA live account is GBP for the user's live rollout, so dashboard money
-    labels should show £ rather than the old demo/research $ label.
-    Falls back to $ for USD/unknown.
+    The standalone BCO demo mirrors the live Project Exit Plan dashboard in GBP.
+    DISPLAY_CURRENCY controls presentation only; it does not FX-convert OANDA
+    account values. Use a GBP-denominated practice account for exact parity.
     """
-    c = safe_str(currency).upper()
-    if c == "GBP" or safe_str(OANDA_ENV).lower() == "live":
+    c = safe_str(currency or DISPLAY_CURRENCY).upper()
+    if c == "GBP":
         return "£"
     if c == "EUR":
         return "€"
+    if c == "JPY":
+        return "¥"
     return "$"
 
 
@@ -10154,6 +10170,7 @@ def get_or_update_index_broker_upl_highwater(
     open_count: int,
     broker_upl: float,
     latest_signal_time: str,
+    family: str = "INDEX_BASKET",
 ) -> Dict[str, Any]:
     """Maintain a broker-actual high-water for the active INDEX_BASKET.
 
@@ -10167,7 +10184,7 @@ def get_or_update_index_broker_upl_highwater(
       - current actual OANDA broker UPL, and
       - broker snapshot UPLs since this active cycle started.
     """
-    family = "INDEX_BASKET"
+    family = safe_str(family or "INDEX_BASKET").upper()
     broker_upl = safe_float(broker_upl) or 0.0
 
     if open_count <= 0:
@@ -10183,7 +10200,7 @@ def get_or_update_index_broker_upl_highwater(
             "broker_high_water_pnl": 0.0,
             "broker_giveback_pct": 0.0,
             "broker_high_water_seen_at_signal_time": "",
-            "reset_reason": "index_basket_flat",
+            "reset_reason": f"{family.lower()}_flat",
         }
 
     row = conn.execute("""
@@ -10312,21 +10329,22 @@ def log_family_basket_check(conn: sqlite3.Connection, family: str, latest_signal
         ORDER BY asset ASC, entry_time ASC
     """, tuple(assets)).fetchall()
 
-    # v10.0.60: for the live INDEX_BASKET, family P&L/high-water must be
-    # grounded in broker-confirmed OANDA-linked trades only. Shadow rows can
-    # briefly remain after a broker entry misses/fails; those are audit rows,
-    # not real live exposure, and must not inflate high-water/giveback.
+    # Broker-enabled family P&L/high-water must be grounded in actual linked
+    # OANDA trades. This now applies to the standalone OIL_BASKET as well as the
+    # live INDEX_BASKET, so missed/phantom shadow entries cannot inflate BCO risk.
     raw_shadow_open_count = len(open_rows)
-    if family == "INDEX_BASKET":
+    broker_scope_assets = {safe_str(x).upper() for x in JUNE_FULL_DEMO_BROKER_ASSETS}
+    if broker_scope_assets.intersection({safe_str(x).upper() for x in assets}):
+        link_placeholders = ",".join(["?"] * len(assets))
         broker_confirmed_ids = {
             safe_str(r["shadow_trade_id"])
-            for r in conn.execute("""
+            for r in conn.execute(f"""
                 SELECT shadow_trade_id
                 FROM broker_trade_links
-                WHERE UPPER(COALESCE(shadow_asset,'')) IN ('NAS100','US500')
+                WHERE UPPER(COALESCE(shadow_asset,'')) IN ({link_placeholders})
                   AND UPPER(COALESCE(status,'')) IN ('OPEN','LINKED')
                   AND COALESCE(shadow_trade_id,'') != ''
-            """).fetchall()
+            """, tuple(safe_str(x).upper() for x in assets)).fetchall()
         }
         open_rows = [r for r in open_rows if safe_str(r["trade_id"]) in broker_confirmed_ids]
 
@@ -13915,10 +13933,14 @@ RESEARCH_CONTEXT_MILESTONES = [12, 24, 48, 72, 96]
 # The old 10k default was close to being reached with 12 research assets x 4 context TF rows.
 # Still capped to protect the live Railway SQLite dashboard from accidentally requesting unlimited rows.
 RESEARCH_CONTEXT_DASHBOARD_LIMIT = max(1500, min(int(float(os.getenv("RESEARCH_CONTEXT_DASHBOARD_LIMIT", "50000"))), 100000))
-RESEARCH_CONTEXT_DEFAULT_ASSETS = {
-    "XAUUSD", "XAU", "XAGUSD", "XAG",
-    "NIKKEI", "JP225", "WTI", "USOIL", "OIL", "BCOUSD", "UKOIL", "BRENT",
-}
+RESEARCH_CONTEXT_DEFAULT_ASSETS = (
+    {"BCOUSD", "UKOIL", "BRENT"}
+    if BCO_STANDALONE_MODE
+    else {
+        "XAUUSD", "XAU", "XAGUSD", "XAG",
+        "NIKKEI", "JP225", "WTI", "USOIL", "OIL", "BCOUSD", "UKOIL", "BRENT",
+    }
+)
 RESEARCH_CONTEXT_DROPPED_ASSETS = {
     x.strip().upper()
     for x in os.getenv("RESEARCH_CONTEXT_DROPPED_ASSETS", "DAX,GER40,DE40,US30,DOW").split(",")
@@ -17504,6 +17526,13 @@ def broker_oanda_config() -> Dict[str, Any]:
     return {"status": "ok", "config": oanda_config_status(), "safety": oanda_safety_state(), "time_utc": now_utc_iso()}
 
 
+@app.get("/broker/oanda/safety")
+def broker_oanda_safety_route() -> Dict[str, Any]:
+    """Direct safety endpoint used by the BCO deployment checklist."""
+    init_db()
+    return {"status": "ok", "safety": oanda_safety_state(), "config": oanda_config_status(), "time_utc": now_utc_iso()}
+
+
 @app.get("/broker/control/status")
 def broker_control_status_route() -> Dict[str, Any]:
     init_db()
@@ -20527,7 +20556,7 @@ def dashboard() -> str:
     # Family/tide rows are event snapshots and can be stale immediately after
     # executable closes. For current live tiles/tables, ground displayed
     # open count/P&L/status in the actual open_trades table.
-    index_demo_assets = {"NAS100", "US500"}
+    index_demo_assets = {safe_str(x).upper() for x in (DASHBOARD_SCOPE_ASSETS or ["BCOUSD"])}
     actual_open_by_asset: Dict[str, int] = {}
     actual_pnl_by_asset: Dict[str, float] = {}
     pending_broker_entry_by_asset: Dict[str, int] = {}
@@ -20555,9 +20584,9 @@ def dashboard() -> str:
     pending_index_entries = sum(pending_broker_entry_by_asset.get(_a, 0) for _a in index_demo_assets)
     phantom_index_entries = len(phantom_index_open_rows)
 
-    # Actual broker/account values from OANDA. With the current live setup only
-    # NAS100/US500 are broker-enabled, so account open-trade UPL is the cleanest
-    # live headline for index basket P&L/high-water/giveback. The linked shadow
+    # Actual broker/account values from OANDA. In standalone BCO mode the
+    # practice account is restricted to BCO_USD, so account UPL is the cleanest
+    # broker-actual basket P&L/high-water/giveback source. The linked shadow
     # model P&L remains available as an audit/comparison value.
     broker_nav = safe_float(latest_broker_snapshot["nav"]) if latest_broker_snapshot else None
     broker_balance = safe_float(latest_broker_snapshot["balance"]) if latest_broker_snapshot else None
@@ -20880,6 +20909,18 @@ def dashboard() -> str:
     research_context_candidate_like_count = len(research_context_candidate_like_rows) if 'research_context_candidate_like_rows' in locals() else 0
     research_context_observation_count = len(research_context_all_rows) if 'research_context_all_rows' in locals() else 0
     research_context_dashboard_limit_reached = research_context_observation_count >= RESEARCH_CONTEXT_DASHBOARD_LIMIT
+    if BCO_STANDALONE_MODE:
+        trend_maturity_exhaustion_watch_html = ""
+        trend_efficiency_research_html = ""
+        index_alignment_research_html = ""
+        basket_recovery_research_html = ""
+        index_short_regime_research_html = ""
+        adaptive_acceleration_watch_html = ""
+        nikkei_deep_research_html = ""
+        live_gap_watch_status_html = ""
+        gap_sl_extension_research_html = ""
+        weekend_buffer_research_dashboard_html = ""
+        metals_research_html = ""
     research_context_assets_text = ', '.join(research_context_assets())
     research_context_accepted_summary_rows = _research_context_summary_html(research_context_accepted_summary if 'research_context_accepted_summary' in locals() else [], 'No accepted multi-context research candidates yet.')
     research_context_candidate_like_summary_rows = _research_context_summary_html(research_context_candidate_like_summary if 'research_context_candidate_like_summary' in locals() else [], 'No candidate-like multi-context research rows yet.')
@@ -21411,8 +21452,9 @@ def dashboard() -> str:
     # Replace raw database/check counters with the things we actually need to monitor:
     # family basket state, high-water/giveback, extended runner count and candidate support.
     index_family_row = None
+    dashboard_scope_family = safe_str(DASHBOARD_SCOPE_FAMILY or "OIL_BASKET").upper()
     for r in family_latest_rows:
-        if safe_str(r["family"]).upper() == "INDEX_BASKET":
+        if safe_str(r["family"]).upper() == dashboard_scope_family:
             index_family_row = r
             break
 
@@ -21421,7 +21463,7 @@ def dashboard() -> str:
     # trade count for this tile; a failed/min-size entry can leave actual exposure at 0
     # while the latest TradingView candidate flag is still true. This is display-only
     # support context, not evidence of live exposure.
-    index_assets_for_signal_support = ["NAS100", "US500"]
+    index_assets_for_signal_support = list(index_demo_assets)
     index_assets_total_signal = len(index_assets_for_signal_support)
     index_candidate_assets_signal = 0
     try:
@@ -21448,7 +21490,7 @@ def dashboard() -> str:
         # Candidate support remains based on latest raw signals so it can still show
         # NAS100/US500 support while flat or after a missed broker entry.
         index_status = "FLAT"
-        index_action = "No active index basket"
+        index_action = f"No active {DASHBOARD_SCOPE_LABEL} basket"
         index_pnl = 0.0
         index_shadow_model_pnl = 0.0
         index_hwm = 0.0
@@ -21472,6 +21514,7 @@ def dashboard() -> str:
             open_count=actual_index_open,
             broker_upl=broker_index_upl,
             latest_signal_time=broker_snapshot_time or now_utc_iso(),
+            family=dashboard_scope_family,
         )
         index_hwm = safe_float(broker_hw.get("broker_high_water_pnl")) or index_pnl
         index_giveback = safe_float(broker_hw.get("broker_giveback_pct")) or 0.0
@@ -21566,9 +21609,10 @@ def dashboard() -> str:
                 <div class="label">NAV</div>
                 <div class="value {pnl_class(broker_unrealized or 0)}">{nav_value}</div>
                 <div class="small">Balance: {balance_value} | UPL: {unrealized_value}</div>
+                <div class="small">Display currency: {esc(DISPLAY_CURRENCY)} (presentation only)</div>
             </div>
             <div class="card">
-                <div class="label">Index Broker P&L</div>
+                <div class="label">{esc(DASHBOARD_SCOPE_LABEL)} Broker P&L</div>
                 <div class="value {pnl_class(index_pnl)}">{money(index_pnl)}</div>
                 <div class="small">{esc(index_r_text)} | actual OANDA UPL | {esc(index_status)}</div>
             </div>
@@ -21591,7 +21635,7 @@ def dashboard() -> str:
                 <div class="small">This month: <span class="{pnl_class(broker_month_pnl if broker_month_pnl is not None else 0.0)}">{broker_month_display}</span> | Excludes logged deposits/withdrawals</div>
             </div>
             <div class="card">
-                <div class="label">Index Open Trades</div>
+                <div class="label">{esc(DASHBOARD_SCOPE_LABEL)} Open Trades</div>
                 <div class="value">{esc(index_open)}</div>
                 <div class="small">Broker-confirmed live trades | Phase: {esc(index_phase)}</div>
                 <div class="small">Pending entry: {esc(pending_index_entries)} | Phantom: {esc(phantom_index_entries)}</div>
@@ -21614,7 +21658,7 @@ def dashboard() -> str:
                 <div class="small">Missing: {esc(', '.join(latest_cov.get('missing_pairs', [])) or 'None')}</div>
             </div>
             <div class="card">
-                <div class="label">Index Candidate Support</div>
+                <div class="label">{esc(DASHBOARD_SCOPE_LABEL)} Candidate Support</div>
                 <div class="value {candidate_support_class}">{esc(candidate_support_text)}</div>
                 <div class="small">Candidate assets currently true</div>
             </div>
@@ -21724,7 +21768,7 @@ def dashboard() -> str:
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Project Exit Plan Dashboard</title>
+        <title>{esc(DASHBOARD_TITLE)}</title>
         <meta http-equiv="refresh" content="60">
         <style>
             body {{ font-family: Arial, sans-serif; margin: 24px; background: #f6f7f9; color: #111827; }}
@@ -21904,25 +21948,25 @@ def dashboard() -> str:
         </style>
     </head>
     <body>
-        <h1>Project Exit Plan Dashboard</h1>
-        <div class="sub">Live Index Trading — exposure-first control layout. Auto-refreshes every 60 seconds. Generated at {esc(now_display_iso())} ({esc(DISPLAY_TIME_LABEL)}).</div>
+        <h1>{esc(DASHBOARD_TITLE)}</h1>
+        <div class="sub">{esc(DASHBOARD_SUBTITLE)} — exposure-first control layout. Auto-refreshes every 60 seconds. Generated at {esc(now_display_iso())} ({esc(DISPLAY_TIME_LABEL)}).</div>
 
         {top_cards}
 
         <details class="priority dashboard-group">
-            <summary>OANDA / Broker / Accounting — Live Trading Control Centre</summary>
-            <div class="section-note small">Broker execution, OANDA reconciliation, exposure/margin guardrails, financing and accounting. This is the main mechanical health section for the live index trading.</div>
+            <summary>OANDA / Broker / Accounting — BCO Demo Control Centre</summary>
+            <div class="section-note small">Broker execution, OANDA reconciliation, exposure/margin guardrails, financing and accounting. This is the main mechanical health section for the BCO practice-account test.</div>
             {broker_dashboard_html}
         </details>
 
         {harvest_plan_html}
 
         <details class="priority dashboard-group">
-            <summary>Index Basket Manager / Live Defence</summary>
+            <summary>BCO Basket Manager / Demo Defence</summary>
             <div class="section-note small">Grouped basket-management view: family basket, per-asset tide-turn, defence escalation, harvest/protection logic, managed stop candidates, weekend/gap handling, and advice-outcome tracking.</div>
 
             <details>
-                <summary>Current Index / Asset Basket State</summary>
+                <summary>Current BCO / Oil Basket State</summary>
                 <div class="table-scroll"><table>
                 <thead>
                     <tr>
@@ -22100,8 +22144,7 @@ def dashboard() -> str:
             <a href="/signal-coverage">Signal Coverage JSON</a>
             <a href="/signals/latest">Latest JSON</a>
             <a href="/signals/counts">Counts JSON</a>
-            <a href="/signals/by-pair/NAS100">NAS100 JSON</a>
-            <a href="/signals/by-pair/US500">US500 JSON</a>
+            <a href="/signals/by-pair/BCOUSD">BCOUSD JSON</a>
             <a href="/open-trades">Open Trades JSON</a>
             <a href="/closed-trades">Closed Trades JSON</a>
             <a href="/decisions">Decisions JSON</a>
@@ -22149,8 +22192,8 @@ def dashboard() -> str:
         <details class="utility-links">
             <summary>Current Phase / Notes</summary>
             <div class="small">
-            Current phase: Railway full-stacking shadow management plus OANDA broker tracking and live-controlled broker automation. Webhook signal processing now runs shadow-auto open scan, auto-close check and broker reconciliation after each accepted signal, still gated by OANDA environment, kill switch, read-only/execution flags and max-link caps. NAS100/US500 retain their existing scope. BCOUSD can be explicitly enabled on an OANDA practice service as a separate 1H/8H long-only OIL_BASKET with uncapped hourly stacking, 3.5% emergency SL and post-48h management. Metals remain research-only.
-            Basket risk, tide-turn and tiered defence now drive live index entry throttling/defensive closes when JUNE_FULL_DEMO_EXECUTE_BASKET_MANAGER=true. Dynamic-exit, adaptive acceleration watch and metals streams remain research-only. Live execution multiplier is hard-locked at 1.00x.
+            Current phase: standalone BCO practice-account forward test using the same Project Exit Plan full-stacking shadow management, OANDA broker linking, retries, reconciliation, staged basket defence, native managed stops and accounting structure. BCOUSD is frozen to 1H execution / 8H context, long-only OIL_BASKET, uncapped hourly stacking, 3.5% emergency SL and post-48h management.
+            Basket risk, tide-turn and tiered defence drive BCO entry throttling/defensive closes when JUNE_FULL_DEMO_EXECUTE_BASKET_MANAGER=true. Non-BCO research panels are hidden in standalone mode. Live execution multiplier is hard-locked at 1.00x.
             Open Shadow Trades "Next Review" is recalculated from current hold; after 48c extension it reviews every new candle/hour. Open Shadow Trades is horizontally scrollable on mobile.
             Use Download Full Export ZIP for analysis uploads.
             </div>
@@ -22243,44 +22286,54 @@ def _close_shadow_trade_for_harvest(conn: sqlite3.Connection, trade_dict: Dict[s
 
 
 def execute_index_harvest_if_needed(limit: int = 250, source: str = "auto") -> Dict[str, Any]:
-    """Execute 40/60/75/100R harvest closes on mature profitable linked index trades."""
+    """Execute the Project Exit Plan 40/60/75/100R ladder for the active dashboard family.
+
+    The historic function name is retained for compatibility, but standalone BCO
+    mode targets OIL_BASKET / BCOUSD rather than INDEX_BASKET.
+    """
     if not BROKER_HARVEST_EXECUTION_ENABLED:
         return {"ok": True, "skipped": True, "reason": "BROKER_HARVEST_EXECUTION_ENABLED=false"}
     safety = oanda_safety_state()
     if not safety.get("orders_allowed"):
         return {"ok": False, "skipped": True, "reason": safe_str(safety.get("reason") or "orders not allowed"), "safety": safety}
-    risk_unit = float(effective_broker_shadow_auto_risk_amount() or BROKER_SHADOW_AUTO_RISK_AMOUNT or 0.0)
+    harvest_family = safe_str(DASHBOARD_SCOPE_FAMILY or "INDEX_BASKET").upper()
+    harvest_assets = [safe_str(x).upper() for x in (DASHBOARD_SCOPE_ASSETS or ["NAS100", "US500"])]
+    if len(harvest_assets) == 1:
+        risk_unit = float(effective_broker_shadow_auto_risk_amount_for_asset(harvest_assets[0]) or 0.0)
+    else:
+        risk_unit = float(effective_broker_shadow_auto_risk_amount() or BROKER_SHADOW_AUTO_RISK_AMOUNT or 0.0)
     if risk_unit <= 0:
         return {"ok": False, "skipped": True, "reason": "risk unit <= 0"}
     init_db()
     with get_conn() as conn:
-        fam = conn.execute("SELECT * FROM active_family_basket_cycles WHERE family='INDEX_BASKET' LIMIT 1").fetchone()
+        fam = conn.execute("SELECT * FROM active_family_basket_cycles WHERE family=? LIMIT 1", (harvest_family,)).fetchone()
         if not fam:
-            return {"ok": True, "skipped": True, "reason": "no active INDEX_BASKET family row"}
+            return {"ok": True, "skipped": True, "reason": f"no active {harvest_family} family row"}
         fam_d = dict(fam)
         open_count = int(safe_float(fam_d.get("open_trades")) or 0)
         if open_count <= 0 or safe_str(fam_d.get("status")).lower() == "closed":
-            return {"ok": True, "skipped": True, "reason": "index basket flat/closed"}
-        cycle_id = safe_str(fam_d.get("family_cycle_id") or "INDEX_BASKET")
+            return {"ok": True, "skipped": True, "reason": f"{harvest_family} basket flat/closed"}
+        cycle_id = safe_str(fam_d.get("family_cycle_id") or harvest_family)
         high_water = safe_float(fam_d.get("high_water_pnl_50risk")) or 0.0
         high_water_r = high_water / risk_unit if risk_unit else 0.0
         already_rows = conn.execute(
-            "SELECT threshold_r FROM broker_harvest_events WHERE family='INDEX_BASKET' AND family_cycle_id=? AND status IN ('EXECUTED','PARTIAL')",
-            (cycle_id,),
+            "SELECT threshold_r FROM broker_harvest_events WHERE family=? AND family_cycle_id=? AND status IN ('EXECUTED','PARTIAL')",
+            (harvest_family, cycle_id),
         ).fetchall()
         already = {int(safe_float(r["threshold_r"]) or 0) for r in already_rows}
-        rows = conn.execute("""
+        asset_placeholders = ",".join(["?"] * len(harvest_assets))
+        rows = conn.execute(f"""
             SELECT o.*, l.id AS link_id, l.instrument AS broker_instrument, l.broker_trade_id,
                    l.filled_units, l.last_known_units, l.last_known_price, l.side AS broker_side
             FROM open_trades o
             JOIN broker_trade_links l ON l.shadow_trade_id = o.trade_id
             WHERE o.status='open'
-              AND UPPER(o.asset) IN ('NAS100','US500')
+              AND UPPER(o.asset) IN ({asset_placeholders})
               AND UPPER(COALESCE(l.status,''))='OPEN'
               AND COALESCE(l.broker_trade_id,'') <> ''
             ORDER BY COALESCE(o.hold_candles,0) DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, tuple(harvest_assets + [limit])).fetchall()
         candidates = []
         for r in rows:
             d = dict(r)
@@ -22306,7 +22359,7 @@ def execute_index_harvest_if_needed(limit: int = 250, source: str = "auto") -> D
                 conn.execute("""
                     INSERT INTO broker_harvest_events (created_at_utc,family,family_cycle_id,threshold_r,bank_fraction,target_bank_pnl,executed_bank_pnl_approx,risk_per_trade,high_water_pnl,high_water_r,status,reason,raw_json)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (now_utc_iso(), "INDEX_BASKET", cycle_id, float(threshold_r), float(fraction), target, 0.0, risk_unit, high_water, high_water_r, "NO_ELIGIBLE_TRADES", "threshold hit but no mature profitable linked trades", json.dumps({"source": source})))
+                """, (now_utc_iso(), harvest_family, cycle_id, float(threshold_r), float(fraction), target, 0.0, risk_unit, high_water, high_water_r, "NO_ELIGIBLE_TRADES", "threshold hit but no mature profitable linked trades", json.dumps({"source": source})))
                 conn.commit()
                 already.add(int(threshold_r))
                 continue
