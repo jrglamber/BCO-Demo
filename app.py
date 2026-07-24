@@ -8536,6 +8536,33 @@ def reconcile_latest_index_candidate_entries(source: str = "maintenance", max_ag
                 item.update({"skipped": True, "reason": "active broker open intent already exists", "queue_id": existing_intent.get("id"), "queue_status": existing_intent.get("status")})
                 result["items"].append(item)
                 continue
+
+            # v10.0.99 / BCO demo v1.3: never reopen a manually/native-stopped
+            # broker trade for the same shadow/candle. The old latest-signal repair
+            # saw the still-open BCO shadow, noticed that the active link had gone,
+            # and recreated the order. A terminal broker link is definitive evidence
+            # that this exact shadow trade already had its broker execution lifecycle.
+            with get_conn() as _terminal_conn:
+                terminal_link = _terminal_conn.execute("""
+                    SELECT id, status, broker_trade_id, closed_at_utc, last_reconciled_at_utc
+                    FROM broker_trade_links
+                    WHERE shadow_trade_id = ?
+                      AND UPPER(COALESCE(status,'')) IN ('CLOSED_OR_NOT_OPEN','CLOSE_SENT','CLOSED','CANCELLED')
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (trade_id,)).fetchone()
+                terminal_link = dict(terminal_link) if terminal_link else None
+            if terminal_link:
+                item.update({
+                    "skipped": True,
+                    "reason": "terminal broker link exists for this shadow trade; not reopening",
+                    "terminal_broker_trade_link_id": terminal_link.get("id"),
+                    "terminal_broker_trade_id": terminal_link.get("broker_trade_id"),
+                    "terminal_broker_link_status": terminal_link.get("status"),
+                })
+                result["items"].append(item)
+                continue
+
             exec_res = broker_auto_execute_new_shadow_trade(trade_id, asset, from_current_signal_event=True)
             item.update({"executed_reconcile_attempt": True, "broker_result": exec_res})
             if not exec_res.get("ok") and not exec_res.get("retrying") and not exec_res.get("queued_only"):
@@ -8864,7 +8891,7 @@ def close_shadow_trade_as_broker_missed(
     reason: str = "broker_entry_missed",
     use_current_shadow_mark: bool = False,
 ) -> bool:
-    """Remove a NAS100/US500 shadow trade that is not real broker exposure.
+    """Remove a managed shadow trade that is not real broker exposure.
 
     For a broker entry that never opened, close at entry with zero model P&L.
     For a broker trade that *did* exist but later disappeared from OANDA openTrades
@@ -8882,7 +8909,7 @@ def close_shadow_trade_as_broker_missed(
     if not trade:
         return False
     asset = safe_str(trade["asset"]).upper()
-    if asset not in {"NAS100", "US500"}:
+    if asset not in {"NAS100", "US500", "BCOUSD"}:
         return False
 
     entry_price = safe_float(trade["entry_price"]) or 0.0
@@ -8917,7 +8944,7 @@ def close_shadow_trade_as_broker_missed(
 
 
 def sync_missed_broker_shadow_trades(limit: int = 500) -> Dict[str, Any]:
-    """Close NAS100/US500 shadows that are no longer real OANDA exposure.
+    """Close managed shadows that are no longer real OANDA exposure.
 
     Handles two different cases:
     1. Broker entry never opened / retry expired -> close shadow at entry (0 model P&L).
@@ -8945,7 +8972,7 @@ def sync_missed_broker_shadow_trades(limit: int = 500) -> Dict[str, Any]:
         rows = [dict(r) for r in conn.execute("""
             SELECT *
             FROM open_trades
-            WHERE UPPER(asset) IN ('NAS100','US500')
+            WHERE UPPER(asset) IN ('NAS100','US500','BCOUSD')
             ORDER BY created_at_utc ASC, entry_time ASC
             LIMIT ?
         """, (int(limit),)).fetchall()]
