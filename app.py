@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO Demo Dashboard - v10.0.99 - Project Exit Plan Mirror"
+APP_NAME = "BCO Demo Dashboard - v10.1.00 - Project Exit Plan Mirror"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "/data/bco_demo.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
@@ -750,6 +750,17 @@ BROKER_GAP_WATCH_FREEZE_MANAGED_STOP_TIGHTENING = env_bool("BROKER_GAP_WATCH_FRE
 GAP_SL_EXTENSION_RESEARCH_HORIZONS = [6, 12, 24, 48]
 GAP_SL_EXTENSION_RESEARCH_PCTS = [2.0, 2.5]
 
+# v10.1.00 oil Friday weekend-risk shadow configuration
+OIL_WEEKEND_RISK_SHADOW_ENABLED = env_bool("OIL_WEEKEND_RISK_SHADOW_ENABLED", True)
+OIL_WEEKEND_RISK_ASSETS = {x.strip().upper() for x in os.getenv("OIL_WEEKEND_RISK_ASSETS", "BCOUSD").split(",") if x.strip()}
+OIL_WEEKEND_REVIEW_WEEKDAY = int(float(os.getenv("OIL_WEEKEND_REVIEW_WEEKDAY", "4")))
+OIL_WEEKEND_REVIEW_START_HOUR_UK = int(float(os.getenv("OIL_WEEKEND_REVIEW_START_HOUR_UK", "18")))
+OIL_WEEKEND_DECISION_SHOCK_PCT = float(os.getenv("OIL_WEEKEND_DECISION_SHOCK_PCT", "9.0"))
+OIL_WEEKEND_DISPLAY_SHOCK_PCTS = [6.0, 9.0, 12.0, 14.0]
+OIL_WEEKEND_MAX_POST_SHOCK_LOSS_ACCOUNT_PCT = float(os.getenv("OIL_WEEKEND_MAX_POST_SHOCK_LOSS_ACCOUNT_PCT", "1.5"))
+OIL_WEEKEND_MIN_PROFIT_CUSHION_FRACTION = float(os.getenv("OIL_WEEKEND_MIN_PROFIT_CUSHION_FRACTION", "0.50"))
+OIL_WEEKEND_FALLBACK_ACCOUNT_EQUITY = float(os.getenv("OIL_WEEKEND_FALLBACK_ACCOUNT_EQUITY", "10000"))
+
 SIGNAL_COVERAGE_LOOKBACK = 8
 SIGNAL_COVERAGE_GRACE_SECONDS = 120
 
@@ -781,6 +792,7 @@ EXPORT_TABLES = {
     "milestone-snapshots": "milestone_snapshots",
     "weekend-gap-watch": "weekend_gap_watch_checks",
     "gap-sl-extension-research": "gap_sl_extension_research",
+    "oil-weekend-risk-shadow": "oil_weekend_risk_shadow",
     "execution-audit": "execution_audit_events",
     "advice-outcome-audit": "advice_outcome_audit",
     "broker-snapshots": "broker_snapshots",
@@ -7784,6 +7796,13 @@ def init_db() -> None:
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS oil_weekend_risk_shadow (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, created_at_utc TEXT NOT NULL, raw_signal_id INTEGER, review_time_utc TEXT, review_time_uk TEXT, is_friday_review_window INTEGER, family TEXT, assets TEXT, open_trades INTEGER, account_equity REAL, normal_stop_pct REAL, total_intended_stop_risk REAL, current_basket_profit REAL, current_basket_R REAL, weakest_trade_R REAL, average_trade_R REAL, youngest_age_hours REAL, oldest_age_hours REAL, shock_6_loss REAL, shock_6_post_basket_pnl REAL, shock_9_loss REAL, shock_9_post_basket_pnl REAL, shock_12_loss REAL, shock_12_post_basket_pnl REAL, shock_14_loss REAL, shock_14_post_basket_pnl REAL, decision_shock_pct REAL, max_post_shock_loss_account_pct REAL, allowed_post_shock_loss REAL, profit_cushion_fraction REAL, profit_cushion_ratio REAL, status TEXT, proposed_close_count INTEGER, proposed_close_trade_ids TEXT, retained_trade_count INTEGER, retained_basket_profit REAL, retained_shock_loss REAL, retained_post_shock_pnl REAL, reason TEXT, shadow_only INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_oil_weekend_risk_shadow_raw_signal ON oil_weekend_risk_shadow(raw_signal_id)")
+
         # v10.0.96 research-only comparison of the live 1.5% hard SL versus
         # hypothetical 2.0% / 2.5% temporary gap-window SLs. The live SL is
         # deliberately unchanged. Rows are created only when the normal hard SL
@@ -8300,6 +8319,11 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
             "error": f"{type(e).__name__}: {e}",
             "research_only": True,
         }
+
+    try:
+        result["oil_weekend_risk_shadow"] = record_oil_weekend_risk_shadow_for_raw_signal(int(new_signal_db_id))
+    except Exception as e:
+        result["oil_weekend_risk_shadow"] = {"ok": False, "error": f"{type(e).__name__}: {e}", "shadow_only": True}
 
     # Keep these isolated. One failure should not stop the worker from recording
     # the rest of the maintenance state.
@@ -10611,6 +10635,135 @@ def log_weekend_gap_watch_check(
         open_basket_R, losing_pct,
     ))
     return decision
+
+
+# ============================================================
+# v10.1.00 - OIL FRIDAY WEEKEND-RISK SHADOW MODULE
+# ============================================================
+
+def _oil_weekend_review_window(dt: Optional[datetime] = None) -> bool:
+    dt = dt or now_utc()
+    uk = dt.astimezone(_zone(DISPLAY_TIMEZONE))
+    return uk.weekday() == OIL_WEEKEND_REVIEW_WEEKDAY and uk.hour >= OIL_WEEKEND_REVIEW_START_HOUR_UK
+
+
+def _oil_weekend_account_equity(conn: sqlite3.Connection) -> float:
+    row = conn.execute("SELECT nav, balance FROM broker_snapshots WHERE COALESCE(nav,balance) IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+    if row:
+        val = safe_float(row["nav"]) or safe_float(row["balance"])
+        if val and val > 0:
+            return float(val)
+    return OIL_WEEKEND_FALLBACK_ACCOUNT_EQUITY
+
+
+def build_oil_weekend_risk_snapshot_from_conn(conn: sqlite3.Connection, raw_signal_id: int = 0, review_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    review_dt = review_dt or now_utc()
+    review_uk = review_dt.astimezone(_zone(DISPLAY_TIMEZONE))
+    assets = sorted(OIL_WEEKEND_RISK_ASSETS or {"BCOUSD"})
+    marks = ",".join(["?"] * len(assets))
+    rows = [dict(r) for r in conn.execute(f"SELECT * FROM open_trades WHERE UPPER(COALESCE(asset,'')) IN ({marks}) AND LOWER(COALESCE(direction,'long'))='long' AND UPPER(COALESCE(status,'OPEN')) NOT IN ('CLOSED','EXITED') ORDER BY entry_time, trade_id", tuple(assets)).fetchall()]
+    equity = _oil_weekend_account_equity(conn)
+    trades = []
+    for r in rows:
+        asset = safe_str(r.get("asset")).upper()
+        stop = float(get_cfg(asset).get("sl_pct", BCO_DEMO_SL_PCT) or BCO_DEMO_SL_PCT)
+        risk = float(get_cfg(asset).get("risk_dollars", BCO_DEMO_RISK_AMOUNT) or BCO_DEMO_RISK_AMOUNT)
+        current_r = float(safe_float(r.get("return_pct")) or 0.0) / stop if stop else 0.0
+        entry_dt = parse_dt(r.get("entry_time")) or parse_signal_candle_dt(r.get("entry_time"))
+        age_h = max(0.0, (review_dt - entry_dt.astimezone(timezone.utc)).total_seconds()/3600.0) if entry_dt else float(safe_float(r.get("hold_candles")) or 0.0)
+        trades.append({"trade_id": safe_str(r.get("trade_id")), "risk": risk, "stop": stop, "r": current_r, "pnl": current_r*risk, "age": age_h})
+
+    def loss(items, shock):
+        return sum(t["risk"] * shock / t["stop"] for t in items if t["stop"] > 0)
+
+    n = len(trades)
+    basket_profit = sum(t["pnl"] for t in trades)
+    basket_r = sum(t["r"] for t in trades)
+    total_risk = sum(t["risk"] for t in trades)
+    avg_stop = sum(t["stop"]*t["risk"] for t in trades)/total_risk if total_risk else BCO_DEMO_SL_PCT
+    shock_values = {s: (loss(trades, s), basket_profit-loss(trades, s)) for s in OIL_WEEKEND_DISPLAY_SHOCK_PCTS}
+    decision_loss = loss(trades, OIL_WEEKEND_DECISION_SHOCK_PCT)
+    allowed_negative = equity * OIL_WEEKEND_MAX_POST_SHOCK_LOSS_ACCOUNT_PCT / 100.0
+    post_shock = basket_profit - decision_loss
+    cushion = max(0.0, basket_profit)/decision_loss if decision_loss > 0 else 1.0
+    in_window = _oil_weekend_review_window(review_dt)
+    retained = list(trades)
+    proposed = []
+
+    if not n:
+        status, reason = "NO_OPEN_OIL", "No open long oil trades."
+    elif not in_window:
+        status, reason = "MONITOR", "Outside Friday review window; metrics are display-only."
+    elif post_shock < -allowed_negative and cushion < OIL_WEEKEND_MIN_PROFIT_CUSHION_FRACTION:
+        status = "DEFEND"
+        for candidate in sorted(trades, key=lambda t: (t["r"], t["age"])):
+            rem_loss = loss(retained, OIL_WEEKEND_DECISION_SHOCK_PCT)
+            rem_profit = sum(t["pnl"] for t in retained)
+            rem_cushion = max(0.0, rem_profit)/rem_loss if rem_loss > 0 else 1.0
+            if rem_profit-rem_loss >= -allowed_negative or rem_cushion >= OIL_WEEKEND_MIN_PROFIT_CUSHION_FRACTION:
+                break
+            proposed.append(candidate)
+            retained = [t for t in retained if t["trade_id"] != candidate["trade_id"]]
+        reason = f"Friday DEFEND shadow: {OIL_WEEKEND_DECISION_SHOCK_PCT:.1f}% shock projects {money(post_shock)} and profit covers only {cushion*100:.1f}% of shock loss. Propose weakest-R closures only."
+    elif post_shock < -allowed_negative:
+        status, reason = "REVIEW", f"Shock breaches loss threshold, but basket profit covers {cushion*100:.1f}% of modeled shock loss; no automatic closure proposed."
+    else:
+        status, reason = "HOLD", f"Projected {OIL_WEEKEND_DECISION_SHOCK_PCT:.1f}% shock leaves {money(post_shock)}, within the configured allowance."
+
+    retained_profit = sum(t["pnl"] for t in retained)
+    retained_loss = loss(retained, OIL_WEEKEND_DECISION_SHOCK_PCT)
+    return {
+        "created_at_utc": now_utc_iso(), "raw_signal_id": int(raw_signal_id or 0), "review_time_utc": review_dt.isoformat(), "review_time_uk": review_uk.isoformat(),
+        "is_friday_review_window": int(in_window), "family": "OIL_BASKET", "assets": ",".join(assets), "open_trades": n, "account_equity": equity,
+        "normal_stop_pct": avg_stop, "total_intended_stop_risk": total_risk, "current_basket_profit": basket_profit, "current_basket_R": basket_r,
+        "weakest_trade_R": min([t["r"] for t in trades], default=None), "average_trade_R": basket_r/n if n else None,
+        "youngest_age_hours": min([t["age"] for t in trades], default=None), "oldest_age_hours": max([t["age"] for t in trades], default=None),
+        "shock_6_loss": shock_values[6.0][0], "shock_6_post_basket_pnl": shock_values[6.0][1], "shock_9_loss": shock_values[9.0][0], "shock_9_post_basket_pnl": shock_values[9.0][1],
+        "shock_12_loss": shock_values[12.0][0], "shock_12_post_basket_pnl": shock_values[12.0][1], "shock_14_loss": shock_values[14.0][0], "shock_14_post_basket_pnl": shock_values[14.0][1],
+        "decision_shock_pct": OIL_WEEKEND_DECISION_SHOCK_PCT, "max_post_shock_loss_account_pct": OIL_WEEKEND_MAX_POST_SHOCK_LOSS_ACCOUNT_PCT,
+        "allowed_post_shock_loss": allowed_negative, "profit_cushion_fraction": OIL_WEEKEND_MIN_PROFIT_CUSHION_FRACTION, "profit_cushion_ratio": cushion,
+        "status": status, "proposed_close_count": len(proposed), "proposed_close_trade_ids": ",".join(t["trade_id"] for t in proposed),
+        "retained_trade_count": len(retained), "retained_basket_profit": retained_profit, "retained_shock_loss": retained_loss,
+        "retained_post_shock_pnl": retained_profit-retained_loss, "reason": reason, "shadow_only": 1,
+    }
+
+
+def record_oil_weekend_risk_shadow_for_raw_signal(raw_signal_id: int) -> Dict[str, Any]:
+    if not OIL_WEEKEND_RISK_SHADOW_ENABLED:
+        return {"ok": True, "skipped": True, "reason": "disabled", "shadow_only": True}
+    with get_conn() as conn:
+        signal = conn.execute("SELECT pair FROM raw_signals WHERE id=?", (int(raw_signal_id),)).fetchone()
+        if not signal or normalise_index_asset(signal["pair"]) not in OIL_WEEKEND_RISK_ASSETS:
+            return {"ok": True, "skipped": True, "reason": "non_oil_signal", "shadow_only": True}
+        if conn.execute("SELECT 1 FROM oil_weekend_risk_shadow WHERE raw_signal_id=?", (int(raw_signal_id),)).fetchone():
+            return {"ok": True, "skipped": True, "reason": "already_recorded", "shadow_only": True}
+        snap = build_oil_weekend_risk_snapshot_from_conn(conn, raw_signal_id)
+        cols = list(snap)
+        conn.execute(f"INSERT INTO oil_weekend_risk_shadow ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})", tuple(snap[c] for c in cols))
+        conn.commit()
+    return {"ok": True, "status": snap["status"], "open_trades": snap["open_trades"], "proposed_close_count": snap["proposed_close_count"], "shadow_only": True}
+
+
+def latest_oil_weekend_risk_snapshot() -> Dict[str, Any]:
+    init_db()
+    with get_conn() as conn:
+        live = build_oil_weekend_risk_snapshot_from_conn(conn)
+        recent = [dict(r) for r in conn.execute("SELECT * FROM oil_weekend_risk_shadow ORDER BY id DESC LIMIT 100").fetchall()]
+    return {"status": "ok", "shadow_only": True, "live": live, "recent_rows": recent, "time_utc": now_utc_iso()}
+
+
+def build_oil_weekend_risk_shadow_html() -> str:
+    try:
+        snap = latest_oil_weekend_risk_snapshot(); live = snap.get("live") or {}; recent = snap.get("recent_rows") or []
+    except Exception as e:
+        return f'<details class="priority"><summary>Oil Friday Weekend-Risk - Shadow Only</summary><div class="section-note warn">Unavailable: {esc(e)}</div></details>'
+    status = safe_str(live.get("status") or "NO_DATA").upper()
+    cls = "status_green" if status == "HOLD" else "status_red" if status == "DEFEND" else "status_amber" if status == "REVIEW" else "flat"
+    rows_html = "".join(f'<tr><td>{esc(display_utc_time(r.get("created_at_utc")))}</td><td>{esc(r.get("status"))}</td><td>{esc(r.get("open_trades"))}</td><td>{money(r.get("current_basket_profit"))}</td><td>{money(r.get("shock_9_post_basket_pnl"))}</td><td>{esc(r.get("proposed_close_count"))}</td></tr>' for r in recent[:30]) or '<tr><td colspan="6">No snapshots yet.</td></tr>'
+    return f'''<details class="priority dashboard-group" open><summary>Oil Friday Weekend-Risk - Shadow Only</summary>
+    <div class="section-note small">Long-only. Stacking remains unrestricted. No broker orders are sent. DEFEND requires both a 9% shock loss beyond 1.5% of equity and profit cushion below 50%. <a href="/export/oil-weekend-risk-shadow.csv">CSV</a></div>
+    <div class="cards four"><div class="card"><div class="label">Decision</div><div class="value {cls}">{esc(status)}</div></div><div class="card"><div class="label">Open oil longs</div><div class="value">{esc(live.get("open_trades"))}</div><div class="small">P&L {money(live.get("current_basket_profit"))}</div></div><div class="card"><div class="label">Post 9% shock</div><div class="value {pnl_class(live.get("shock_9_post_basket_pnl"))}">{money(live.get("shock_9_post_basket_pnl"))}</div></div><div class="card"><div class="label">Proposed closures</div><div class="value {cls}">{esc(live.get("proposed_close_count"))}</div><div class="small">Retain {esc(live.get("retained_trade_count"))}</div></div></div>
+    <div class="section-note small">{esc(live.get("reason"))}</div><div class="table-scroll"><table><thead><tr><th>Recorded</th><th>Status</th><th>Open</th><th>Basket P&L</th><th>Post 9%</th><th>Close</th></tr></thead><tbody>{rows_html}</tbody></table></div></details>'''
 
 
 # ============================================================
@@ -15770,6 +15923,11 @@ def build_live_gap_watch_status_html() -> str:
     """
 
 
+@app.get("/oil-weekend-risk-shadow")
+def oil_weekend_risk_shadow() -> Dict[str, Any]:
+    return latest_oil_weekend_risk_snapshot()
+
+
 @app.get("/weekend-gap-watch")
 def weekend_gap_watch(limit: int = 100) -> Dict[str, Any]:
     init_db()
@@ -20330,6 +20488,7 @@ def dashboard() -> str:
     managed_stop_research_dashboard_html = build_managed_stop_research_dashboard_html()
     live_gap_watch_status_html = build_live_gap_watch_status_html()
     gap_sl_extension_research_html = build_gap_sl_extension_research_html()
+    oil_weekend_risk_shadow_html = build_oil_weekend_risk_shadow_html()
     trend_maturity_exhaustion_watch_html = build_trend_maturity_exhaustion_watch_html()
     trend_efficiency_research_html = build_trend_efficiency_research_html()
     index_alignment_research_html = build_index_alignment_research_html()
@@ -22014,6 +22173,7 @@ def dashboard() -> str:
             </details>
 
             {live_gap_watch_status_html}
+            {oil_weekend_risk_shadow_html}
 
             {trend_maturity_exhaustion_watch_html}
 
