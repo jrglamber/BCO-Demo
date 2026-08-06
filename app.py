@@ -23,22 +23,33 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO Demo Dashboard - v10.1.00 - Project Exit Plan Mirror"
+APP_NAME = "JP225 Research Dashboard - v10.1.03 - Research Only"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-DB_PATH = os.getenv("DB_PATH", "/data/bco_demo.sqlite")
+DB_PATH = os.getenv("DB_PATH", "/data/bco_demo_formal_forward.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
+JP225_RESEARCH_ONLY_MODE = os.getenv("JP225_RESEARCH_ONLY_MODE", "true").strip().lower() == "true"
+JP225_ACCEPTED_SIGNAL_ASSETS = {
+    x.strip().upper()
+    for x in os.getenv("JP225_ACCEPTED_SIGNAL_ASSETS", "NIKKEI,JP225,JPN225").split(",")
+    if x.strip()
+}
+PERFORMANCE_SCOPE_ASSETS = [
+    x.strip().upper()
+    for x in os.getenv("PERFORMANCE_SCOPE_ASSETS", "NIKKEI").split(",")
+    if x.strip()
+]
 DISPLAY_CURRENCY = os.getenv("DISPLAY_CURRENCY", "GBP").strip().upper()
 DASHBOARD_SCOPE_ASSETS = [
     x.strip().upper()
-    for x in os.getenv("DASHBOARD_SCOPE_ASSETS", "BCOUSD").split(",")
+    for x in os.getenv("DASHBOARD_SCOPE_ASSETS", "NIKKEI").split(",")
     if x.strip()
 ]
-DASHBOARD_SCOPE_FAMILY = os.getenv("DASHBOARD_SCOPE_FAMILY", "OIL_BASKET").strip().upper()
-DASHBOARD_SCOPE_LABEL = os.getenv("DASHBOARD_SCOPE_LABEL", "BCO").strip() or "BCO"
-DASHBOARD_TITLE = os.getenv("DASHBOARD_TITLE", "BCO Demo Dashboard").strip() or "BCO Demo Dashboard"
+DASHBOARD_SCOPE_FAMILY = os.getenv("DASHBOARD_SCOPE_FAMILY", "JAPAN_INDEX").strip().upper()
+DASHBOARD_SCOPE_LABEL = os.getenv("DASHBOARD_SCOPE_LABEL", "JP225").strip() or "JP225"
+DASHBOARD_TITLE = os.getenv("DASHBOARD_TITLE", "JP225 Research Dashboard").strip() or "JP225 Research Dashboard"
 DASHBOARD_SUBTITLE = os.getenv(
     "DASHBOARD_SUBTITLE",
-    "Project Exit Plan mirror — BCO 1H/8H practice-account forward test",
+    "Project Exit Plan — JP225/Nikkei 1H multi-context research only; no broker execution",
 ).strip()
 SQLITE_TIMEOUT_SECONDS = float(os.getenv("SQLITE_TIMEOUT_SECONDS", "45"))
 SQLITE_BUSY_TIMEOUT_MS = int(float(os.getenv("SQLITE_BUSY_TIMEOUT_MS", str(int(SQLITE_TIMEOUT_SECONDS * 1000)))) )
@@ -372,7 +383,7 @@ BROKER_ALLOWED_INSTRUMENTS = {
 # - Keep Nikkei marked as demo/test research, not live-approved.
 # - Create shadow/demo-managed LONG candidate=true rows only.
 # - Do NOT broker-promote Nikkei while NAS100/US500 remain live-money assets.
-NIKKEI_DEMO_ENABLED = os.getenv("NIKKEI_DEMO_ENABLED", "false").strip().lower() == "true"
+NIKKEI_DEMO_ENABLED = os.getenv("NIKKEI_DEMO_ENABLED", "true" if JP225_RESEARCH_ONLY_MODE else "false").strip().lower() == "true"
 NIKKEI_DEMO_INSTRUMENT = os.getenv("OANDA_NIKKEI_INSTRUMENT", os.getenv("OANDA_JP225_INSTRUMENT", "JP225_USD")).strip().upper()
 NIKKEI_DEMO_SL_PCT = float(os.getenv("NIKKEI_DEMO_SL_PCT", "2.0"))
 NIKKEI_DEMO_DIRECTION = os.getenv("NIKKEI_DEMO_DIRECTION", "long").strip().lower()
@@ -395,7 +406,7 @@ if NIKKEI_DEMO_ENABLED and NIKKEI_BROKER_EXECUTION_ENABLED:
 # - every accepted hourly signal creates a new stacked trade (no entry cap/cooldown)
 # - 3.5% emergency SL
 # - minimum 48h hold; hourly basket management thereafter through 72/96/120h
-BCO_DEMO_ENABLED = os.getenv("BCO_DEMO_ENABLED", "true").strip().lower() == "true"
+BCO_DEMO_ENABLED = os.getenv("BCO_DEMO_ENABLED", "false" if JP225_RESEARCH_ONLY_MODE else "true").strip().lower() == "true"
 BCO_DEMO_INSTRUMENT = os.getenv("OANDA_BCO_INSTRUMENT", "BCO_USD").strip().upper()
 BCO_DEMO_SL_PCT = float(os.getenv("BCO_DEMO_SL_PCT", "3.5"))
 BCO_DEMO_DIRECTION = os.getenv("BCO_DEMO_DIRECTION", "long").strip().lower()
@@ -544,7 +555,7 @@ app = FastAPI(title=APP_NAME)
 
 CONFIG = {
     "NAS100": {
-        "enabled": not BCO_STANDALONE_MODE,
+        "enabled": (not BCO_STANDALONE_MODE) and (not JP225_RESEARCH_ONLY_MODE),
         "direction": "long",
         "sl_pct": 1.5,
         "risk_dollars": BROKER_SHADOW_AUTO_RISK_AMOUNT,
@@ -564,7 +575,7 @@ CONFIG = {
         "allow_down_extension": False,
     },
     "US500": {
-        "enabled": not BCO_STANDALONE_MODE,
+        "enabled": (not BCO_STANDALONE_MODE) and (not JP225_RESEARCH_ONLY_MODE),
         "direction": "long",
         "sl_pct": 1.5,
         "risk_dollars": BROKER_SHADOW_AUTO_RISK_AMOUNT,
@@ -584,7 +595,7 @@ CONFIG = {
         "allow_down_extension": False,
     },
     "NIKKEI": {
-        "enabled": NIKKEI_DEMO_ENABLED,
+        "enabled": NIKKEI_DEMO_ENABLED or JP225_RESEARCH_ONLY_MODE,
         "direction": NIKKEI_DEMO_DIRECTION,
         "sl_pct": NIKKEI_DEMO_SL_PCT,
         "risk_dollars": NIKKEI_DEMO_RISK_AMOUNT,
@@ -722,6 +733,42 @@ JUNE_FULL_DEMO_MIN_OPEN_TRADES_FOR_ENTRY_BLOCK = int(float(os.getenv("JUNE_FULL_
 JUNE_FULL_DEMO_MIN_OPEN_TRADES_FOR_STRICT_ENTRY_BLOCK = int(float(os.getenv("JUNE_FULL_DEMO_MIN_OPEN_TRADES_FOR_STRICT_ENTRY_BLOCK", "25")))
 JUNE_FULL_DEMO_ENTRY_BLOCK_TINY_SEVERE_R = float(os.getenv("JUNE_FULL_DEMO_ENTRY_BLOCK_TINY_SEVERE_R", "-3.0"))
 JUNE_FULL_DEMO_ENTRY_BLOCK_EARLY_SEVERE_R = float(os.getenv("JUNE_FULL_DEMO_ENTRY_BLOCK_EARLY_SEVERE_R", "-2.0"))
+
+
+# ============================================================
+# v10.1.03 - JP225 RESEARCH-ONLY HARD SAFETY LOCK
+# ============================================================
+# This Railway service is now a data/research destination only. These overrides
+# deliberately win over stale Railway variables so neither JP225 nor any other
+# symbol can reach OANDA from this app.
+if JP225_RESEARCH_ONLY_MODE:
+    OANDA_ENABLED = False
+    BROKER_READ_ONLY = True
+    BROKER_EXECUTION_ENABLED = False
+    BROKER_KILL_SWITCH = True
+    BROKER_SHADOW_AUTO_EXECUTION_ENABLED = False
+    BROKER_SHADOW_AUTO_CLOSE_ENABLED = False
+    BROKER_SHADOW_AUTO_EXECUTE_QUEUED = False
+    BROKER_SHADOW_AUTO_ALLOW_OPEN_SCAN_BACKFILL = False
+    BROKER_LATEST_SIGNAL_RECONCILE_ENABLED = False
+    BROKER_RETRY_BACKGROUND_WORKER_ENABLED = False
+    BROKER_MANAGED_STOPS_ENABLED = False
+    BROKER_MANAGED_STOPS_AUTO_SYNC_ENABLED = False
+    BROKER_HARVEST_EXECUTION_ENABLED = False
+    JUNE_FULL_DEMO_ENABLED = False
+    JUNE_FULL_DEMO_EXECUTE_BASKET_MANAGER = False
+    JUNE_FULL_DEMO_BLOCK_ENTRIES_ON_BASKET_PAUSE = False
+    BCO_DEMO_ENABLED = False
+    BCO_BROKER_EXECUTION_ENABLED = False
+    NIKKEI_BROKER_EXECUTION_ENABLED = False
+    OIL_WEEKEND_RISK_SHADOW_ENABLED = False
+
+    BROKER_ALLOWED_INSTRUMENTS.clear()
+    BROKER_SHADOW_AUTO_ALLOWED_ASSETS.clear()
+    BROKER_LATEST_SIGNAL_RECONCILE_ASSETS.clear()
+    JUNE_FULL_DEMO_BROKER_ASSETS.clear()
+    JUNE_FULL_DEMO_CLOSE_INSTRUMENTS.clear()
+    JUNE_FULL_DEMO_RESEARCH_ONLY_ASSETS = {"NIKKEI", "JP225", "JPN225"}
 
 # Known stream exception: there is no expected 17:00 timestamp candle.
 IGNORED_SIGNAL_HOURS = {17}
@@ -8253,6 +8300,21 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
         result["ok"] = False
         result["shadow_manager"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+    # v10.1.03: this service owns JP225 research only. Raw/context storage and
+    # Railway shadow-state updates are complete at this point; skip every broker,
+    # OANDA, US-index, metals and oil maintenance path for speed and safety.
+    if JP225_RESEARCH_ONLY_MODE:
+        result["research_only_short_circuit"] = {
+            "ok": True,
+            "reason": "JP225 research stored; broker/OANDA and unrelated research maintenance skipped",
+            "accepted_assets": sorted(JP225_ACCEPTED_SIGNAL_ASSETS),
+        }
+        try:
+            log_system_event("jp225_research_signal_processed", json.dumps(result, default=str)[:3500])
+        except Exception:
+            pass
+        return result
+
     # v10.0.80: research-only trend efficiency / chop metric.
     # This records market-structure context only. It must not affect live trading.
     try:
@@ -13384,8 +13446,19 @@ def finalise_trade_status(status: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_performance_summary(conn: sqlite3.Connection) -> Dict[str, Any]:
-    open_rows = conn.execute("SELECT * FROM open_trades").fetchall()
-    closed_rows = conn.execute("SELECT * FROM closed_trades").fetchall()
+    if PERFORMANCE_SCOPE_ASSETS:
+        scope_placeholders = ",".join(["?"] * len(PERFORMANCE_SCOPE_ASSETS))
+        open_rows = conn.execute(
+            f"SELECT * FROM open_trades WHERE UPPER(asset) IN ({scope_placeholders})",
+            tuple(PERFORMANCE_SCOPE_ASSETS),
+        ).fetchall()
+        closed_rows = conn.execute(
+            f"SELECT * FROM closed_trades WHERE UPPER(asset) IN ({scope_placeholders})",
+            tuple(PERFORMANCE_SCOPE_ASSETS),
+        ).fetchall()
+    else:
+        open_rows = conn.execute("SELECT * FROM open_trades").fetchall()
+        closed_rows = conn.execute("SELECT * FROM closed_trades").fetchall()
     starts = get_period_starts()
     assets = sorted(set(list(CONFIG.keys()) + [safe_str(r["asset"]) for r in open_rows] + [safe_str(r["asset"]) for r in closed_rows]))
 
@@ -14114,16 +14187,23 @@ RESEARCH_CONTEXT_MILESTONES = [12, 24, 48, 72, 96]
 # Still capped to protect the live Railway SQLite dashboard from accidentally requesting unlimited rows.
 RESEARCH_CONTEXT_DASHBOARD_LIMIT = max(1500, min(int(float(os.getenv("RESEARCH_CONTEXT_DASHBOARD_LIMIT", "50000"))), 100000))
 RESEARCH_CONTEXT_DEFAULT_ASSETS = (
-    {"BCOUSD", "UKOIL", "BRENT"}
-    if BCO_STANDALONE_MODE
-    else {
-        "XAUUSD", "XAU", "XAGUSD", "XAG",
-        "NIKKEI", "JP225", "WTI", "USOIL", "OIL", "BCOUSD", "UKOIL", "BRENT",
-    }
+    {"NIKKEI", "JP225", "JPN225"}
+    if JP225_RESEARCH_ONLY_MODE
+    else (
+        {"BCOUSD", "UKOIL", "BRENT"}
+        if BCO_STANDALONE_MODE
+        else {
+            "XAUUSD", "XAU", "XAGUSD", "XAG",
+            "NIKKEI", "JP225", "WTI", "USOIL", "OIL", "BCOUSD", "UKOIL", "BRENT",
+        }
+    )
 )
 RESEARCH_CONTEXT_DROPPED_ASSETS = {
     x.strip().upper()
-    for x in os.getenv("RESEARCH_CONTEXT_DROPPED_ASSETS", "DAX,GER40,DE40,US30,DOW").split(",")
+    for x in os.getenv(
+        "RESEARCH_CONTEXT_DROPPED_ASSETS",
+        "XAUUSD,XAU,XAGUSD,XAG,DAX,GER40,DE40,US30,DOW,WTI,USOIL,OIL,BCOUSD,BCO,UKOIL,BRENT" if JP225_RESEARCH_ONLY_MODE else "DAX,GER40,DE40,US30,DOW",
+    ).split(",")
     if x.strip()
 }
 
@@ -14357,6 +14437,13 @@ def health() -> Dict[str, Any]:
         "status": "ok",
         "db_path": DB_PATH,
         "database_runtime": database_runtime_status(),
+        "jp225_research_only_mode": JP225_RESEARCH_ONLY_MODE,
+        "accepted_signal_assets": sorted(JP225_ACCEPTED_SIGNAL_ASSETS),
+        "performance_scope_assets": PERFORMANCE_SCOPE_ASSETS,
+        "research_context_assets": research_context_assets(),
+        "broker_execution_hard_disabled": bool(JP225_RESEARCH_ONLY_MODE),
+        "broker_allowed_instruments": sorted(BROKER_ALLOWED_INSTRUMENTS),
+        "oanda_enabled": OANDA_ENABLED,
         "raw_signal_count": raw_count,
         "open_trade_count": open_count,
         "closed_trade_count": closed_count,
@@ -20114,9 +20201,9 @@ def build_nikkei_deep_research_snapshot(limit: int = NIKKEI_RESEARCH_DASHBOARD_L
         "ok": True,
         "research_only": True,
         "title": "Nikkei / JP225 Deep Research",
-        "mode_note": "Shadow/demo research only. Nikkei is not broker-enabled unless NIKKEI_BROKER_EXECUTION_ENABLED=true and it is explicitly added to the broker allowed asset/instrument lists.",
-        "broker_execution_enabled_for_nikkei": env_bool("NIKKEI_BROKER_EXECUTION_ENABLED", False),
-        "nikkei_demo_enabled": env_bool("NIKKEI_DEMO_ENABLED", True),
+        "mode_note": "Research only. Broker and OANDA execution are hard-disabled in this JP225 Research Hub build.",
+        "broker_execution_enabled_for_nikkei": bool(NIKKEI_BROKER_EXECUTION_ENABLED and not JP225_RESEARCH_ONLY_MODE),
+        "nikkei_demo_enabled": bool(NIKKEI_DEMO_ENABLED or JP225_RESEARCH_ONLY_MODE),
         "nikkei_demo_sl_pct": float(os.getenv("NIKKEI_DEMO_SL_PCT", os.getenv("RESEARCH_NIKKEI_SL_PCT", "2.0"))),
         "counts": counts,
         "latest_raw_rows": latest_raw,
@@ -20203,7 +20290,7 @@ def build_nikkei_deep_research_html() -> str:
         <summary>Nikkei / JP225 Deep Research — Shadow Demo</summary>
         <div class="section-note small">
             Separate Nikkei lane so JP225 is not buried in the generic multi-context table. Current mode: <strong class="{broker_cls}">{esc(broker_label)}</strong>.
-            NAS100/US500 live broker execution is unchanged. Nikkei remains shadow/demo research unless deliberately broker-enabled later.
+            This service is JP225/Nikkei research only. OANDA and broker execution are hard-disabled.
             Exports: <a href="/nikkei-deep-research">JSON</a> | <a href="/export/nikkei-deep-research.csv">CSV</a>.
         </div>
         <div class="cards four">
@@ -21102,7 +21189,8 @@ def dashboard() -> str:
         basket_recovery_research_html = ""
         index_short_regime_research_html = ""
         adaptive_acceleration_watch_html = ""
-        nikkei_deep_research_html = ""
+        if not JP225_RESEARCH_ONLY_MODE:
+            nikkei_deep_research_html = ""
         live_gap_watch_status_html = ""
         gap_sl_extension_research_html = ""
         weekend_buffer_research_dashboard_html = ""
@@ -21116,8 +21204,8 @@ def dashboard() -> str:
 
     research_context_html = f"""
         <details class="dashboard-group">
-            <summary>Multi-Context Research — XAU / XAG / Nikkei / Oil (BCO)</summary>
-            <div class="section-note small"><strong>Research-only lane.</strong> One hourly alert carries 2H, 4H, 8H and 12H context scenarios. Railway splits those into separate research rows. No broker promotion, no index basket impact, no 15 June go-live impact. Dashboard load limit is now {RESEARCH_CONTEXT_DASHBOARD_LIMIT} rows; use exports for the full file. Single-context XAU/XAG metal candidates remain in the Metals Deep Research section/export, not this multi-context table.</div>
+            <summary>JP225 / Nikkei Multi-Context Research</summary>
+            <div class="section-note small"><strong>Research-only lane.</strong> The JP225 hourly alert carries 2H, 4H, 8H and 12H context scenarios. Railway stores the raw alert and evaluates each context separately. OANDA and all broker execution paths are hard-disabled in this service.</div>
             <div class="cards four">
                 <div class="card"><div class="label">Research Assets</div><div class="value">{esc(str(len(research_context_assets())))}</div><div class="small muted">{esc(research_context_assets_text)}</div></div>
                 <div class="card"><div class="label">Accepted Scenarios</div><div class="value">{research_context_accepted_count}</div><div class="small muted">forward_test_candidate=true by context TF</div></div>
@@ -22368,10 +22456,10 @@ def dashboard() -> str:
             <a href="/export/broker-harvest-events.csv">Broker Harvest Events CSV</a>
             <a href="/export/managed-stop-research.csv">Managed Stop Research CSV</a>
             <a href="/export/adaptive-acceleration-watch.csv">Adaptive Acceleration Watch CSV</a>
-            <a href="/export/metals-deep-research.csv">Metals Deep Research CSV</a>
-            <a href="/export/metals-short-research.csv?candidates_only=true">Metals Short Research Candidates CSV</a>
-            <a href="/export/metals-short-research.csv?candidates_only=false">Metals Short Research All CSV</a>
-            <a href="/export/metals-research-outcomes.csv">Metals Research Outcomes CSV</a>
+            
+            
+            
+            
             <a href="/export/broker-snapshots.csv">Broker Snapshots CSV</a>
             </div>
         </details>
@@ -22667,6 +22755,17 @@ async def tradingview_webhook(
     source = safe_str(body.get("source") or payload.get("source") or "direct_or_unknown")
     raw_pair = safe_str(payload.get("pair") or payload.get("ticker") or payload.get("symbol") or "")
     pair = normalise_index_asset(raw_pair)
+
+    if JP225_RESEARCH_ONLY_MODE and pair != "NIKKEI":
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "JP225 Research Hub accepts only NIKKEI/JP225/JPN225 signals",
+            "pair": pair,
+            "raw_pair": raw_pair,
+            "received_at_utc": now_utc_iso(),
+        }
+
     signal_id = safe_str(payload.get("signal_id", ""))
     raw_timestamp = payload.get("timestamp") or payload.get("time")
     timestamp_info = normalise_timestamp(raw_timestamp, signal_id)
@@ -22684,7 +22783,7 @@ async def tradingview_webhook(
         pair, payload, raw_forward_test_candidate
     )
     take_trade = safe_str(payload.get("take_trade", ""))
-    model_version = safe_str(payload.get("model_version", ""))
+    model_version = safe_str(payload.get("model_version") or payload.get("model_name") or "")
     received_at = now_utc_iso()
     stored_body = dict(body)
     stored_body["_server_managed_candidate"] = managed_candidate_meta
