@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO + JP225 Research Hub - v10.1.04 - Research Only"
+APP_NAME = "BCO + JP225 Research Hub - v10.1.05 - Research Only"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "/data/bco_demo_formal_forward.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
@@ -739,7 +739,7 @@ JUNE_FULL_DEMO_ENTRY_BLOCK_EARLY_SEVERE_R = float(os.getenv("JUNE_FULL_DEMO_ENTR
 
 
 # ============================================================
-# v10.1.04 - BCO + JP225 RESEARCH-HUB HARD SAFETY LOCK
+# v10.1.05 - BCO + JP225 RESEARCH-HUB HARD SAFETY LOCK
 # ============================================================
 # BCO and JP225 remain fully active as Railway research streams, but this
 # service is not allowed to contact OANDA or place/close broker orders.
@@ -8296,6 +8296,43 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
     """
     result: Dict[str, Any] = {"ok": True, "source": source, "raw_signal_id": int(new_signal_db_id or 0), "time_utc": now_utc_iso()}
 
+    # v10.1.05 clean research-hub fast path. Resolve the stored asset first so
+    # BCO/JP225 never run inherited US-index/live-broker maintenance.
+    if BCO_JP225_RESEARCH_HUB_MODE:
+        research_asset = ""
+        try:
+            with get_conn() as conn:
+                row = conn.execute("SELECT pair FROM raw_signals WHERE id = ? LIMIT 1", (int(new_signal_db_id),)).fetchone()
+                research_asset = normalise_index_asset(row["pair"]) if row else ""
+        except Exception as e:
+            result["asset_lookup_error"] = f"{type(e).__name__}: {e}"
+
+        if research_asset == "NIKKEI":
+            result["research_only_short_circuit"] = {
+                "ok": True,
+                "reason": "JP225 raw + multi-context research stored; all inherited live/index/broker maintenance skipped",
+                "accepted_assets": sorted(RESEARCH_HUB_ACCEPTED_SIGNAL_ASSETS),
+            }
+            return result
+
+        if research_asset == "BCOUSD":
+            try:
+                process_shadow_manager(int(new_signal_db_id))
+                result["shadow_manager"] = {"ok": True}
+            except Exception as e:
+                result["ok"] = False
+                result["shadow_manager"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            try:
+                result["oil_weekend_risk_shadow"] = record_oil_weekend_risk_shadow_for_raw_signal(int(new_signal_db_id))
+            except Exception as e:
+                result["oil_weekend_risk_shadow"] = {"ok": False, "error": f"{type(e).__name__}: {e}", "shadow_only": True}
+            result["research_only_short_circuit"] = {
+                "ok": True,
+                "reason": "BCO shadow/post-48/oil research processed; inherited live/index/broker maintenance skipped",
+                "accepted_assets": sorted(RESEARCH_HUB_ACCEPTED_SIGNAL_ASSETS),
+            }
+            return result
+
     # v10.0.93: before a new signal can create a fresh index trade, force-close
     # any stale INDEX_BASKET cycle that is already confirmed flat. This prevents
     # a brand-new one-trade basket from inheriting the previous cycle high-water.
@@ -8311,7 +8348,7 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
         result["ok"] = False
         result["shadow_manager"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    # v10.1.04: JP225 needs raw/context/deep-research storage only. BCO signals
+    # v10.1.05: JP225 needs raw/context/deep-research storage only. BCO signals
     # continue through the existing post-48 and oil/weekend research maintenance.
     # Broker/OANDA execution remains hard-disabled for both assets.
     processed_asset = ""
@@ -20579,7 +20616,7 @@ def export_research_context_outcomes_csv(accepted_only: bool = False, candidate_
     rows = build_research_context_outcomes(limit=limit, accepted_only=accepted_only, candidate_like_only=candidate_like_only)
     return Response(dicts_to_csv(rows), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=research_context_outcomes.csv"})
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get("/dashboard-legacy", response_class=HTMLResponse)
 def dashboard() -> str:
     init_db()
     # v10.0.68: the dashboard must be a read-mostly view. Running broker retry
@@ -23928,3 +23965,420 @@ async def broker_oanda_test_update_managed_stops(request: Request) -> Dict[str, 
         "note": "Protected P&L is an estimate at the stop price, not guaranteed against gaps/slippage.",
         "time_utc": now_utc_iso(),
     }
+
+# ============================================================
+# v10.1.05 - CLEAN BCO + JP225 RESEARCH DASHBOARD / HISTORY IMPORT
+# ============================================================
+# This research service intentionally exposes only BCO/Brent and JP225/Nikkei
+# research on the main dashboard. The inherited live-broker/index/metals helper
+# code remains dormant for backwards compatibility, but it is not executed by
+# /dashboard. This keeps the research UI light and avoids live-project clutter.
+
+MAIN_PROJECT_HISTORY_IMPORT_ENABLED = os.getenv("MAIN_PROJECT_HISTORY_IMPORT_ENABLED", "false").strip().lower() == "true"
+MAIN_PROJECT_HISTORY_SOURCE_BASE_URL = os.getenv("MAIN_PROJECT_HISTORY_SOURCE_BASE_URL", "").strip().rstrip("/")
+MAIN_PROJECT_HISTORY_TRANSFER_SECRET = os.getenv("MAIN_PROJECT_HISTORY_TRANSFER_SECRET", "").strip()
+HISTORY_IMPORT_TIMEOUT_SECONDS = max(10, min(int(float(os.getenv("HISTORY_IMPORT_TIMEOUT_SECONDS", "60"))), 180))
+HISTORY_IMPORT_MAX_BYTES = max(1_000_000, min(int(float(os.getenv("HISTORY_IMPORT_MAX_BYTES", "50000000"))), 200_000_000))
+
+_HUB_BCO_ASSETS = {"BCOUSD", "BCO", "UKOIL", "BRENT"}
+_HUB_JP_ASSETS = {"NIKKEI", "JP225", "JPN225", "JP225_USD", "ICMARKETS:JP225"}
+
+
+def _hub_norm_asset(value: Any) -> str:
+    raw = safe_str(value).upper()
+    compact = raw.replace(" ", "").replace("-", "").replace("_", "").replace(":", "")
+    if raw in _HUB_BCO_ASSETS or compact in {"BCOUSD", "BCO", "UKOIL", "BRENT"} or "BRENT" in raw or "BCO" in raw:
+        return "BCOUSD"
+    if raw in _HUB_JP_ASSETS or compact in {"NIKKEI", "JP225", "JPN225", "JP225USD", "ICMARKETSJP225"} or "JP225" in raw or "NIKKEI" in raw:
+        return "NIKKEI"
+    return raw
+
+
+def _hub_table_exists(conn: Any, table_name: str) -> bool:
+    try:
+        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table_name,)).fetchone()
+        return bool(row)
+    except Exception:
+        try:
+            conn.execute(f'SELECT 1 FROM "{table_name}" LIMIT 1')
+            return True
+        except Exception:
+            return False
+
+
+def _hub_raw_stats(conn: Any, asset: str) -> Dict[str, Any]:
+    asset = _hub_norm_asset(asset)
+    row = conn.execute("""
+        SELECT COUNT(*) AS c,
+               SUM(CASE WHEN LOWER(COALESCE(forward_test_candidate,'')) IN ('true','1','yes','y','long','buy','take') THEN 1 ELSE 0 END) AS accepted,
+               MIN(timestamp_readable) AS first_signal,
+               MAX(timestamp_readable) AS last_signal,
+               MAX(received_at_utc) AS last_received
+        FROM raw_signals
+        WHERE UPPER(pair)=?
+    """, (asset,)).fetchone()
+    return {
+        "asset": asset,
+        "signals": int((row or {}).get("c", 0) if isinstance(row, dict) else (row["c"] if row else 0)),
+        "accepted": int((row or {}).get("accepted", 0) if isinstance(row, dict) else (row["accepted"] if row else 0) or 0),
+        "first_signal": (row or {}).get("first_signal") if isinstance(row, dict) else (row["first_signal"] if row else None),
+        "last_signal": (row or {}).get("last_signal") if isinstance(row, dict) else (row["last_signal"] if row else None),
+        "last_received": (row or {}).get("last_received") if isinstance(row, dict) else (row["last_received"] if row else None),
+    }
+
+
+def _hub_count_asset(conn: Any, table: str, asset: str) -> int:
+    if not _hub_table_exists(conn, table):
+        return 0
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE UPPER(asset)=?", (_hub_norm_asset(asset),)).fetchone()["c"] or 0)
+    except Exception:
+        return 0
+
+
+def research_history_status_snapshot() -> Dict[str, Any]:
+    init_db()
+    with get_conn() as conn:
+        bco = _hub_raw_stats(conn, "BCOUSD")
+        jp = _hub_raw_stats(conn, "NIKKEI")
+        bco.update({
+            "closed_trades": _hub_count_asset(conn, "closed_trades", "BCOUSD"),
+            "open_trades": _hub_count_asset(conn, "open_trades", "BCOUSD"),
+            "post48_reviews": _hub_count_asset(conn, "post48_review_log", "BCOUSD"),
+            "milestone_snapshots": _hub_count_asset(conn, "milestone_snapshots", "BCOUSD"),
+        })
+        jp.update({
+            "closed_trades": _hub_count_asset(conn, "closed_trades", "NIKKEI"),
+            "open_trades": _hub_count_asset(conn, "open_trades", "NIKKEI"),
+            "post48_reviews": _hub_count_asset(conn, "post48_review_log", "NIKKEI"),
+            "milestone_snapshots": _hub_count_asset(conn, "milestone_snapshots", "NIKKEI"),
+        })
+        oil_count = 0
+        if _hub_table_exists(conn, "oil_weekend_risk_shadow"):
+            try:
+                oil_count = int(conn.execute("SELECT COUNT(*) AS c FROM oil_weekend_risk_shadow").fetchone()["c"] or 0)
+            except Exception:
+                pass
+    return {
+        "status": "ok",
+        "research_only": True,
+        "bco": bco,
+        "jp225": jp,
+        "oil_weekend_risk_rows": oil_count,
+        "database_path": DB_PATH,
+        "import_enabled": MAIN_PROJECT_HISTORY_IMPORT_ENABLED,
+        "import_source_configured": bool(MAIN_PROJECT_HISTORY_SOURCE_BASE_URL and MAIN_PROJECT_HISTORY_TRANSFER_SECRET),
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/research-history-status")
+def research_history_status() -> Dict[str, Any]:
+    return research_history_status_snapshot()
+
+
+def _hub_fmt(v: Any, dp: int = 2, suffix: str = "") -> str:
+    n = safe_float(v)
+    return "—" if n is None else f"{n:.{dp}f}{suffix}"
+
+
+def _hub_context_summary_html(asset: str) -> str:
+    all_rows = [r for r in build_research_context_outcomes(limit=50000, accepted_only=False, candidate_like_only=False) if _hub_norm_asset(r.get("asset")) == _hub_norm_asset(asset)]
+    accepted_rows = [r for r in all_rows if int(r.get("candidate") or 0) == 1]
+    summary = summarise_research_context_outcomes(accepted_rows)
+    if not summary:
+        return '<div class="empty">No matured accepted context outcomes available yet.</div>'
+    rows = []
+    for r in summary:
+        rows.append(f"""
+        <tr>
+          <td><strong>{esc(r.get('context_tf'))}</strong></td>
+          <td>{esc(r.get('accepted_candidates'))}</td>
+          <td>{esc(r.get('n_12h'))}</td><td class="{pnl_class(r.get('avg_return_12h_pct'))}">{_hub_fmt(r.get('avg_return_12h_pct'),2,'%')}</td>
+          <td>{esc(r.get('n_48h'))}</td><td class="{pnl_class(r.get('avg_return_48h_pct'))}">{_hub_fmt(r.get('avg_return_48h_pct'),2,'%')}</td><td>{_hub_fmt(r.get('win_rate_48h_pct'),1,'%')}</td>
+          <td>{esc(r.get('n_72h'))}</td><td class="{pnl_class(r.get('avg_return_72h_pct'))}">{_hub_fmt(r.get('avg_return_72h_pct'),2,'%')}</td>
+          <td>{esc(r.get('n_96h'))}</td><td class="{pnl_class(r.get('avg_return_96h_pct'))}">{_hub_fmt(r.get('avg_return_96h_pct'),2,'%')}</td>
+        </tr>""")
+    return """
+    <div class="table-scroll"><table>
+      <thead><tr><th>Context</th><th>Accepted</th><th>12h N</th><th>12h Avg</th><th>48h N</th><th>48h Avg</th><th>48h Win</th><th>72h N</th><th>72h Avg</th><th>96h N</th><th>96h Avg</th></tr></thead>
+      <tbody>""" + "".join(rows) + "</tbody></table></div>"
+
+
+def _hub_recent_raw_html(asset: str, limit: int = 20) -> str:
+    asset = _hub_norm_asset(asset)
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, timestamp_readable, received_at_utc, pair, context_tf, execution_tf,
+                   exec_close, forward_test_candidate, model_version, signal_id, raw_json
+            FROM raw_signals WHERE UPPER(pair)=? ORDER BY id DESC LIMIT ?
+        """, (asset, int(limit))).fetchall()
+    if not rows:
+        return '<div class="empty">No signals stored yet.</div>'
+    out=[]
+    for r in rows:
+        raw={}
+        try: raw=json.loads(r["raw_json"] or "{}")
+        except Exception: pass
+        side=safe_str(raw.get("signal_side"))
+        cand=is_true(r["forward_test_candidate"])
+        out.append(f"<tr><td>{esc(r['id'])}</td><td>{esc(display_candle_time(r['timestamp_readable']))}</td><td>{esc(side or '—')}</td><td class={'true' if cand else 'false'}>{'true' if cand else 'false'}</td><td>{esc(r['context_tf'])}</td><td>{esc(r['model_version'])}</td><td>{_hub_fmt(r['exec_close'],2)}</td></tr>")
+    return '<div class="table-scroll"><table><thead><tr><th>ID</th><th>Candle</th><th>Side</th><th>Candidate</th><th>Context</th><th>Model</th><th>Close</th></tr></thead><tbody>'+''.join(out)+'</tbody></table></div>'
+
+
+def _hub_bco_post48_html(limit: int = 20) -> str:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT trade_id, review_time, hold_candles, return_pct, mfe_pct, mae_pct, action, reason
+            FROM post48_review_log WHERE UPPER(asset)='BCOUSD' ORDER BY id DESC LIMIT ?
+        """, (int(limit),)).fetchall()
+    if not rows:
+        return '<div class="empty">No BCO post-48 reviews stored yet.</div>'
+    body=''.join(f"<tr><td>{esc(r['trade_id'])}</td><td>{esc(display_candle_time(r['review_time']))}</td><td>{esc(r['hold_candles'])}</td><td class={pnl_class(r['return_pct'])}>{_hub_fmt(r['return_pct'],2,'%')}</td><td>{_hub_fmt(r['mfe_pct'],2,'%')}</td><td>{_hub_fmt(r['mae_pct'],2,'%')}</td><td>{esc(r['action'])}</td><td>{esc(r['reason'])}</td></tr>" for r in rows)
+    return '<div class="table-scroll"><table><thead><tr><th>Trade</th><th>Review</th><th>Age</th><th>Return</th><th>MFE</th><th>MAE</th><th>Action</th><th>Reason</th></tr></thead><tbody>'+body+'</tbody></table></div>'
+
+
+def _hub_bco_milestones_html(limit: int = 20) -> str:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT trade_id, milestone_candle, snapshot_time, return_pct, mfe_pct, mae_pct, note
+            FROM milestone_snapshots WHERE UPPER(asset)='BCOUSD' ORDER BY id DESC LIMIT ?
+        """, (int(limit),)).fetchall()
+    if not rows:
+        return '<div class="empty">No BCO milestone snapshots stored yet.</div>'
+    body=''.join(f"<tr><td>{esc(r['trade_id'])}</td><td>{esc(r['milestone_candle'])}h</td><td>{esc(display_candle_time(r['snapshot_time']))}</td><td class={pnl_class(r['return_pct'])}>{_hub_fmt(r['return_pct'],2,'%')}</td><td>{_hub_fmt(r['mfe_pct'],2,'%')}</td><td>{_hub_fmt(r['mae_pct'],2,'%')}</td><td>{esc(r['note'])}</td></tr>" for r in rows)
+    return '<div class="table-scroll"><table><thead><tr><th>Trade</th><th>Milestone</th><th>Snapshot</th><th>Return</th><th>MFE</th><th>MAE</th><th>Note</th></tr></thead><tbody>'+body+'</tbody></table></div>'
+
+
+def _hub_oil_weekend_html(limit: int = 12) -> str:
+    with get_conn() as conn:
+        if not _hub_table_exists(conn, "oil_weekend_risk_shadow"):
+            return '<div class="empty">No BCO weekend-risk table in this database.</div>'
+        rows = conn.execute("SELECT * FROM oil_weekend_risk_shadow ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    if not rows:
+        return '<div class="empty">No BCO Friday/weekend-risk reviews stored yet.</div>'
+    body=[]
+    for r in rows:
+        body.append(f"<tr><td>{esc(r['review_time_uk'])}</td><td>{esc(r['open_trades'])}</td><td class={pnl_class(r['current_basket_profit'])}>{_hub_fmt(r['current_basket_profit'],2)}</td><td>{_hub_fmt(r['shock_9_post_basket_pnl'],2)}</td><td>{esc(r['status'])}</td><td>{esc(r['proposed_close_count'])}</td><td>{esc(r['reason'])}</td></tr>")
+    return '<div class="table-scroll"><table><thead><tr><th>Review</th><th>Trades</th><th>Basket P&L</th><th>Post -9% Shock</th><th>Status</th><th>Proposed Closes</th><th>Reason</th></tr></thead><tbody>'+''.join(body)+'</tbody></table></div>'
+
+
+def _hub_import_target_columns(conn: Any, table: str) -> List[str]:
+    try:
+        return [safe_str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    except Exception:
+        return []
+
+
+def _hub_row_exists(conn: Any, table: str, row: Dict[str, Any]) -> bool:
+    checks = {
+        "raw_signals": ["signal_id"],
+        "closed_trades": ["trade_id"],
+        "decision_log": ["trade_id", "decision_time", "decision_point"],
+        "basket_risk_checks": ["asset", "latest_signal_time", "created_at_utc"],
+        "entry_confirmation_checks": ["signal_id", "signal_time"],
+        "tide_turn_checks": ["asset", "latest_signal_time", "created_at_utc"],
+        "post48_review_log": ["trade_id", "review_time", "hold_candles"],
+        "milestone_snapshots": ["trade_id", "milestone_candle", "snapshot_time"],
+        "weekend_gap_watch_checks": ["asset", "latest_signal_time", "created_at_utc"],
+        "oil_weekend_risk_shadow": ["raw_signal_id", "review_time_utc", "status"],
+    }
+    keys=[k for k in checks.get(table, []) if k in row and safe_str(row.get(k)) != ""]
+    if not keys:
+        return False
+    where=" AND ".join([f'COALESCE(CAST("{k}" AS TEXT),\'\')=?' for k in keys])
+    vals=tuple(safe_str(row.get(k)) for k in keys)
+    try:
+        return conn.execute(f'SELECT 1 AS x FROM "{table}" WHERE {where} LIMIT 1', vals).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _hub_import_csv_table(conn: Any, table: str, csv_text: str) -> Dict[str, Any]:
+    if not _hub_table_exists(conn, table):
+        return {"table": table, "inserted": 0, "skipped": 0, "error": "target_table_missing"}
+    reader=csv.DictReader(io.StringIO(csv_text))
+    target_cols=_hub_import_target_columns(conn, table)
+    inserted=skipped=0
+    for src in reader:
+        row={k:v for k,v in src.items() if k in target_cols and k != "id"}
+        if not row:
+            skipped+=1; continue
+        if "asset" in row and row.get("asset"):
+            row["asset"]=_hub_norm_asset(row["asset"])
+        if table == "raw_signals":
+            row["pair"]=_hub_norm_asset(row.get("pair"))
+            if row["pair"] not in {"BCOUSD", "NIKKEI"}:
+                skipped+=1; continue
+            # If an old source row lacks signal_id, use a stable composite key.
+            if not safe_str(row.get("signal_id")):
+                row["signal_id"] = f"IMPORT_{row['pair']}_{safe_str(row.get('timestamp_readable') or row.get('timestamp'))}_{safe_str(row.get('context_tf'))}_{safe_str(row.get('model_version'))}"
+        if _hub_row_exists(conn, table, row):
+            skipped+=1; continue
+        cols=list(row.keys())
+        placeholders=','.join(['?']*len(cols))
+        col_sql=','.join([f'"{c}"' for c in cols])
+        conn.execute(f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})', tuple(row[c] if row[c] != "" else None for c in cols))
+        inserted+=1
+    return {"table": table, "inserted": inserted, "skipped": skipped}
+
+
+def _hub_fetch_main_history_zip() -> bytes:
+    if not MAIN_PROJECT_HISTORY_SOURCE_BASE_URL:
+        raise RuntimeError("MAIN_PROJECT_HISTORY_SOURCE_BASE_URL is not configured")
+    if not MAIN_PROJECT_HISTORY_TRANSFER_SECRET:
+        raise RuntimeError("MAIN_PROJECT_HISTORY_TRANSFER_SECRET is not configured")
+    url = MAIN_PROJECT_HISTORY_SOURCE_BASE_URL + "/export/bco-jp225-research-history.zip?limit=100000&secret=" + urllib.parse.quote(MAIN_PROJECT_HISTORY_TRANSFER_SECRET)
+    req=urllib.request.Request(url, headers={"User-Agent":"BCO-JP225-Research-History-Importer/1.0"})
+    with urllib.request.urlopen(req, timeout=HISTORY_IMPORT_TIMEOUT_SECONDS) as resp:
+        data=resp.read(HISTORY_IMPORT_MAX_BYTES + 1)
+    if len(data) > HISTORY_IMPORT_MAX_BYTES:
+        raise RuntimeError("history transfer ZIP exceeded HISTORY_IMPORT_MAX_BYTES")
+    return data
+
+
+@app.post("/admin/import-main-research-history")
+def import_main_research_history(secret: str = "") -> Dict[str, Any]:
+    if not MAIN_PROJECT_HISTORY_IMPORT_ENABLED:
+        raise HTTPException(status_code=403, detail="MAIN_PROJECT_HISTORY_IMPORT_ENABLED=false")
+    if not WEBHOOK_SECRET or safe_str(secret) != safe_str(WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+    init_db()
+    try:
+        blob=_hub_fetch_main_history_zip()
+        zf=zipfile.ZipFile(io.BytesIO(blob), "r")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not fetch/read main-project history ZIP: {e}")
+    file_to_table={
+        "raw-signals-bco.csv":"raw_signals",
+        "raw-signals-nikkei.csv":"raw_signals",
+        "bco-closed-trades.csv":"closed_trades",
+        "bco-decisions.csv":"decision_log",
+        "bco-basket-risk.csv":"basket_risk_checks",
+        "bco-entry-confirmation.csv":"entry_confirmation_checks",
+        "bco-tide-turn.csv":"tide_turn_checks",
+        "bco-post48-reviews.csv":"post48_review_log",
+        "bco-milestone-snapshots.csv":"milestone_snapshots",
+        "bco-weekend-gap-watch.csv":"weekend_gap_watch_checks",
+        "bco-oil-weekend-risk-shadow.csv":"oil_weekend_risk_shadow",
+    }
+    results=[]
+    with get_conn() as conn:
+        for filename, table in file_to_table.items():
+            if filename not in zf.namelist():
+                results.append({"table":table,"file":filename,"inserted":0,"skipped":0,"note":"file_not_in_source_zip"}); continue
+            text=zf.read(filename).decode("utf-8-sig", errors="replace")
+            r=_hub_import_csv_table(conn, table, text); r["file"]=filename; results.append(r)
+        conn.commit()
+    return {
+        "status":"ok",
+        "research_only":True,
+        "source":MAIN_PROJECT_HISTORY_SOURCE_BASE_URL,
+        "results":results,
+        "after":research_history_status_snapshot(),
+        "next_step":"Set MAIN_PROJECT_HISTORY_IMPORT_ENABLED=false and remove MAIN_PROJECT_HISTORY_TRANSFER_SECRET after verifying counts.",
+        "time_utc":now_utc_iso(),
+    }
+
+
+def _hub_filtered_table_rows(conn: Any, table: str, asset: str, limit: int = 50000) -> List[Dict[str, Any]]:
+    if not _hub_table_exists(conn, table): return []
+    try:
+        return [dict(r) for r in conn.execute(f'SELECT * FROM "{table}" WHERE UPPER(asset)=? ORDER BY id DESC LIMIT ?', (_hub_norm_asset(asset), int(limit))).fetchall()]
+    except Exception:
+        return []
+
+
+def _hub_zip_response(kind: str) -> Response:
+    init_db()
+    kind=safe_str(kind).lower()
+    asset="BCOUSD" if kind=="bco" else "NIKKEI"
+    zip_buffer=io.BytesIO()
+    with zipfile.ZipFile(zip_buffer,"w",zipfile.ZIP_DEFLATED) as zf:
+        with get_conn() as conn:
+            raw=[dict(r) for r in conn.execute("SELECT * FROM raw_signals WHERE UPPER(pair)=? ORDER BY id DESC LIMIT 100000",(asset,)).fetchall()]
+            zf.writestr(f"raw-signals-{kind}.csv", dicts_to_csv(raw))
+            for table in ["closed_trades","decision_log","basket_risk_checks","entry_confirmation_checks","tide_turn_checks","post48_review_log","milestone_snapshots","weekend_gap_watch_checks"]:
+                rows=_hub_filtered_table_rows(conn,table,asset,50000)
+                zf.writestr(f"{table}.csv",dicts_to_csv(rows))
+            if kind=="bco" and _hub_table_exists(conn,"oil_weekend_risk_shadow"):
+                oil=[dict(r) for r in conn.execute("SELECT * FROM oil_weekend_risk_shadow ORDER BY id DESC LIMIT 50000").fetchall()]
+                zf.writestr("oil_weekend_risk_shadow.csv",dicts_to_csv(oil))
+        outcomes=[r for r in build_research_context_outcomes(limit=100000,accepted_only=False,candidate_like_only=False) if _hub_norm_asset(r.get("asset"))==asset]
+        zf.writestr(f"context-outcomes-{kind}.csv",dicts_to_csv(outcomes))
+        zf.writestr("manifest.json",json.dumps({"kind":kind,"asset":asset,"research_only":True,"generated_at_utc":now_utc_iso(),"history":research_history_status_snapshot()},indent=2,default=str))
+    zip_buffer.seek(0)
+    return Response(zip_buffer.getvalue(),media_type="application/zip",headers={"Content-Disposition":f'attachment; filename="{kind}-research.zip"'})
+
+
+@app.get("/export/bco-research.zip")
+def export_clean_bco_research_zip() -> Response:
+    return _hub_zip_response("bco")
+
+
+@app.get("/export/jp225-research.zip")
+def export_clean_jp225_research_zip() -> Response:
+    return _hub_zip_response("jp225")
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def clean_research_dashboard() -> HTMLResponse:
+    init_db()
+    status=research_history_status_snapshot()
+    bco=status["bco"]; jp=status["jp225"]
+    bco_context=_hub_context_summary_html("BCOUSD")
+    jp_context=_hub_context_summary_html("NIKKEI")
+    bco_recent=_hub_recent_raw_html("BCOUSD",20)
+    jp_recent=_hub_recent_raw_html("NIKKEI",20)
+    bco_post48=_hub_bco_post48_html(20)
+    bco_milestones=_hub_bco_milestones_html(20)
+    oil_weekend=_hub_oil_weekend_html(12)
+    html=f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>BCO + JP225 Research Hub</title>
+    <style>
+    :root{{--bg:#0b1220;--panel:#111a2b;--panel2:#172238;--text:#e5e7eb;--muted:#94a3b8;--line:#2b3a55;--green:#4ade80;--red:#fb7185;--amber:#fbbf24;--blue:#60a5fa}}
+    *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}} .wrap{{max-width:1450px;margin:auto;padding:22px}}
+    h1{{margin:0 0 4px;font-size:28px}} .sub{{color:var(--muted);margin-bottom:18px}} .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin:14px 0 20px}}
+    .card{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}} .label{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}} .value{{font-size:25px;font-weight:700;margin:4px 0}} .small{{font-size:12px;color:var(--muted)}}
+    details{{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:12px 0;overflow:hidden}} summary{{cursor:pointer;font-weight:700;padding:14px 16px;background:var(--panel2)}} .inner{{padding:14px}}
+    .table-scroll{{overflow:auto}} table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{padding:8px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;white-space:nowrap}} th{{color:#cbd5e1;background:#0f172a;position:sticky;top:0}}
+    a{{color:var(--blue);text-decoration:none}} .links a{{display:inline-block;margin:4px 14px 4px 0}} .true,.pos{{color:var(--green)}} .false,.neg{{color:var(--red)}} .empty{{color:var(--muted);padding:10px 0}} .pill{{display:inline-block;padding:4px 8px;border-radius:999px;background:#0f172a;border:1px solid var(--line);font-size:12px;color:var(--muted)}}
+    .note{{background:#0f172a;border-left:3px solid var(--blue);padding:10px 12px;color:#cbd5e1;margin:10px 0}} @media(max-width:700px){{.wrap{{padding:12px}}th,td{{font-size:12px}}}}
+    </style></head><body><div class='wrap'>
+    <h1>BCO + JP225 Research Hub</h1><div class='sub'>Research only. No OANDA connection, broker execution, live-account controls, metals, or US-index research.</div>
+    <div class='cards'>
+      <div class='card'><div class='label'>BCO Signals</div><div class='value'>{bco['signals']}</div><div class='small'>Accepted/root candidates: {bco['accepted']} · {esc(bco.get('first_signal') or '—')} → {esc(bco.get('last_signal') or '—')}</div></div>
+      <div class='card'><div class='label'>JP225 / Nikkei Signals</div><div class='value'>{jp['signals']}</div><div class='small'>Accepted/root candidates: {jp['accepted']} · {esc(jp.get('first_signal') or '—')} → {esc(jp.get('last_signal') or '—')}</div></div>
+      <div class='card'><div class='label'>BCO Mature Research</div><div class='value'>{bco['post48_reviews']}</div><div class='small'>Post-48 reviews · {bco['milestone_snapshots']} milestone snapshots</div></div>
+      <div class='card'><div class='label'>Weekend Risk Rows</div><div class='value'>{status['oil_weekend_risk_rows']}</div><div class='small'>BCO Friday/weekend shock research</div></div>
+    </div>
+
+    <details open><summary>BCO / Brent Research</summary><div class='inner'>
+      <div class='note'>Keep BCO focused on evidence: signal quality, context outcomes, post-48 behaviour, MFE/MAE and weekend-risk work. Live broker/accounting controls have been removed from this dashboard.</div>
+      <h3>Accepted multi-context outcomes</h3>{bco_context}
+      <details><summary>Recent BCO signals</summary><div class='inner'>{bco_recent}</div></details>
+      <details><summary>BCO post-48 reviews</summary><div class='inner'>{bco_post48}</div></details>
+      <details><summary>BCO milestone / MFE / MAE snapshots</summary><div class='inner'>{bco_milestones}</div></details>
+      <details><summary>BCO Friday / weekend-risk research</summary><div class='inner'>{oil_weekend}</div></details>
+    </div></details>
+
+    <details open><summary>JP225 / Nikkei Research</summary><div class='inner'>
+      <div class='note'>The single hourly JP225 logger carries long/short/neutral execution state plus 2H, 4H, 8H and 12H context. This section is research-only and does not create broker trades.</div>
+      <h3>Accepted multi-context outcomes</h3>{jp_context}
+      <details><summary>Recent JP225 / Nikkei signals</summary><div class='inner'>{jp_recent}</div></details>
+      <div class='links'><a href='/nikkei-deep-research'>Nikkei deep-research JSON</a><a href='/export/nikkei-deep-research.csv'>Nikkei deep-research CSV</a></div>
+    </div></details>
+
+    <details><summary>History / Data Recovery / Exports</summary><div class='inner'>
+      <div class='cards'>
+        <div class='card'><div class='label'>BCO Stored History</div><div class='value'>{bco['signals']}</div><div class='small'>{bco['closed_trades']} closed shadow trades · {bco['open_trades']} current shadow trades</div></div>
+        <div class='card'><div class='label'>JP225 Stored History</div><div class='value'>{jp['signals']}</div><div class='small'>Data is merged by signal ID; imports are additive and idempotent.</div></div>
+        <div class='card'><div class='label'>Main-project import</div><div class='value'>{'READY' if status['import_enabled'] and status['import_source_configured'] else 'OFF'}</div><div class='small'>Enable only for the one-time history recovery, then turn it off.</div></div>
+      </div>
+      <div class='links'><a href='/research-history-status'>History status JSON</a><a href='/export/bco-research.zip'>Download BCO research ZIP</a><a href='/export/jp225-research.zip'>Download JP225 research ZIP</a></div>
+      <div class='note'>History import never deletes existing rows. It imports only missing BCO/JP225 records from the live project and skips duplicates. Active broker state is not imported.</div>
+    </div></details>
+
+    <details><summary>System / Diagnostics</summary><div class='inner'><div class='links'><a href='/health'>Health JSON</a><a href='/dashboard-legacy'>Legacy dashboard (fallback only)</a></div><p class='small'>The legacy page is retained temporarily as a rollback aid, but it is not the research dashboard.</p></div></details>
+    </div></body></html>"""
+    return HTMLResponse(html)
