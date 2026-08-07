@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO + JP225 Research Hub - v10.1.07 - Directional Chronology Fix"
+APP_NAME = "BCO + JP225 Research Hub - v10.1.08 - BCO Live-Sim Basket Manager"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "/data/bco_demo_formal_forward.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
@@ -8316,12 +8316,20 @@ def run_post_signal_processing(new_signal_db_id: int, source: str = "signal_work
             return result
 
         if research_asset == "BCOUSD":
+            # Keep the old fixed/extension shadow stream as a baseline comparison,
+            # and run the new isolated live-sim basket manager in parallel. Neither
+            # path can contact OANDA in research-hub mode.
             try:
                 process_shadow_manager(int(new_signal_db_id))
                 result["shadow_manager"] = {"ok": True}
             except Exception as e:
                 result["ok"] = False
                 result["shadow_manager"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            try:
+                result["bco_live_sim"] = bco_live_sim_process_signal(int(new_signal_db_id), source=source)
+            except Exception as e:
+                result["ok"] = False
+                result["bco_live_sim"] = {"ok": False, "error": f"{type(e).__name__}: {e}", "research_only": True}
             try:
                 result["oil_weekend_risk_shadow"] = record_oil_weekend_risk_shadow_for_raw_signal(int(new_signal_db_id))
             except Exception as e:
@@ -24310,7 +24318,14 @@ def _hub_zip_response(kind: str) -> Response:
         directional_candidates=[r for r in build_directional_candidate_context_outcomes(limit=200000) if _hub_norm_asset(r.get("asset"))==asset]
         zf.writestr(f"directional-signal-outcomes-{kind}.csv",dicts_to_csv(directional_signal))
         zf.writestr(f"directional-candidate-context-outcomes-{kind}.csv",dicts_to_csv(directional_candidates))
-        zf.writestr("manifest.json",json.dumps({"kind":kind,"asset":asset,"research_only":True,"directional_research":True,"milestones":DIRECTIONAL_RESEARCH_MILESTONES,"generated_at_utc":now_utc_iso(),"history":research_history_status_snapshot()},indent=2,default=str))
+        if kind == "bco":
+            sim = bco_live_sim_snapshot()
+            zf.writestr("bco-live-sim-trades.csv", dicts_to_csv(sim.get("all_trades", [])))
+            zf.writestr("bco-live-sim-decisions.csv", dicts_to_csv(sim.get("decisions", [])))
+            zf.writestr("bco-live-sim-protection.csv", dicts_to_csv(sim.get("protection_stages", [])))
+            zf.writestr("bco-live-sim-stop-events.csv", dicts_to_csv(sim.get("stop_events", [])))
+            zf.writestr("bco-live-sim-snapshot.json", json.dumps(sim, indent=2, default=str))
+        zf.writestr("manifest.json",json.dumps({"kind":kind,"asset":asset,"research_only":True,"directional_research":True,"bco_live_sim_included":bool(kind=="bco"),"milestones":DIRECTIONAL_RESEARCH_MILESTONES,"generated_at_utc":now_utc_iso(),"history":research_history_status_snapshot()},indent=2,default=str))
     zip_buffer.seek(0)
     return Response(zip_buffer.getvalue(),media_type="application/zip",headers={"Content-Disposition":f'attachment; filename="{kind}-research.zip"'})
 
@@ -24767,6 +24782,783 @@ def _hub_directional_html(asset: str, snap: Dict[str, Any]) -> str:
     """
 
 
+
+# ============================================================
+# v10.1.08 - BCO FORWARD-ONLY LIVE-SIM BASKET MANAGER
+# ============================================================
+# Purpose:
+# - emulate the live NAS100/US500 basket-manager behaviour without OANDA;
+# - maintain independent LONG and SHORT BCO books;
+# - stack one virtual trade per qualifying 8H directional candidate;
+# - preserve the 3.5% emergency SL and 48h minimum normal management point;
+# - review every incoming BCO hour, with 48/72 decision gates and uncapped runners;
+# - simulate the live staged young/developing/mature/heavy defence model;
+# - simulate v10.1.26 immediate 100/200/300R banking and pre-48h cohort ratchets;
+# - simulate native managed-stop protection at 48/72/96/120h.
+#
+# This is deliberately isolated from legacy open_trades and ALL broker/OANDA tables.
+# It starts from fresh signals after deployment; historical rows are not replayed into
+# state automatically. Raw/directional history remains available for separate replay.
+BCO_LIVE_SIM_ENABLED = env_bool("BCO_LIVE_SIM_ENABLED", True)
+BCO_LIVE_SIM_RISK_PER_TRADE = max(0.01, float(os.getenv("BCO_LIVE_SIM_RISK_PER_TRADE", "5")))
+BCO_LIVE_SIM_SL_PCT = max(0.10, float(os.getenv("BCO_LIVE_SIM_SL_PCT", "3.5")))
+BCO_LIVE_SIM_MIN_HOLD = max(1, int(float(os.getenv("BCO_LIVE_SIM_MIN_HOLD", "48"))))
+BCO_LIVE_SIM_MAX_OPEN_PER_DIRECTION = max(1, int(float(os.getenv("BCO_LIVE_SIM_MAX_OPEN_PER_DIRECTION", "250"))))
+BCO_LIVE_SIM_BANK_LEVELS = [(100.0, 0.20), (200.0, 0.25), (300.0, 0.50)]
+BCO_LIVE_SIM_COHORT_LEVELS = [(150.0, 0.15), (200.0, 0.30), (300.0, 0.50)]
+BCO_LIVE_SIM_PROTECT_48 = float(os.getenv("BCO_LIVE_SIM_PROTECT_48", "0.25"))
+BCO_LIVE_SIM_PROTECT_72 = float(os.getenv("BCO_LIVE_SIM_PROTECT_72", "0.50"))
+BCO_LIVE_SIM_PROTECT_96 = float(os.getenv("BCO_LIVE_SIM_PROTECT_96", "0.65"))
+BCO_LIVE_SIM_PROTECT_120 = float(os.getenv("BCO_LIVE_SIM_PROTECT_120", "0.75"))
+BCO_LIVE_SIM_MIN_STOP_STEP_PCT = max(0.0, float(os.getenv("BCO_LIVE_SIM_MIN_STOP_STEP_PCT", "0.02")))
+BCO_LIVE_SIM_POLICY_VERSION = "bco_live_sim_v10.1.08_live_index_v10.1.26_behaviour"
+_bco_live_sim_lock = threading.Lock()
+
+
+def _bco_sim_init_schema() -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id TEXT UNIQUE NOT NULL,
+                direction TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                cycle_id TEXT,
+                entry_signal_id INTEGER,
+                entry_time TEXT,
+                entry_price REAL,
+                current_price REAL,
+                hold_candles INTEGER DEFAULT 0,
+                highest_high REAL,
+                lowest_low REAL,
+                return_pct REAL DEFAULT 0,
+                mfe_pct REAL DEFAULT 0,
+                mae_pct REAL DEFAULT 0,
+                current_R REAL DEFAULT 0,
+                nominal_risk REAL,
+                sl_pct REAL,
+                hard_sl_price REAL,
+                managed_stop_price REAL,
+                managed_stop_stage TEXT,
+                decision_48 TEXT DEFAULT '',
+                decision_72 TEXT DEFAULT '',
+                exit_time TEXT,
+                exit_price REAL,
+                exit_reason TEXT,
+                realized_R REAL,
+                realized_pnl REAL,
+                created_at_utc TEXT,
+                updated_at_utc TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_sim_trades_direction_status ON bco_live_sim_trades(direction,status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bco_sim_trades_cycle ON bco_live_sim_trades(cycle_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_basket_state (
+                direction TEXT PRIMARY KEY,
+                cycle_id TEXT,
+                cycle_started_at TEXT,
+                status TEXT DEFAULT 'FLAT',
+                last_signal_time TEXT,
+                open_count INTEGER DEFAULT 0,
+                basket_R REAL DEFAULT 0,
+                basket_pnl REAL DEFAULT 0,
+                high_water_R REAL DEFAULT 0,
+                high_water_pnl REAL DEFAULT 0,
+                high_water_seen_at TEXT,
+                giveback_pct REAL DEFAULT 0,
+                losing_pct REAL DEFAULT 0,
+                basket_phase TEXT DEFAULT 'FLAT',
+                tide_score INTEGER DEFAULT 0,
+                tide_status TEXT DEFAULT 'GREEN',
+                manager_action TEXT DEFAULT 'NO_OPEN_BASKET',
+                manager_detail TEXT DEFAULT '',
+                realized_R_cycle REAL DEFAULT 0,
+                banked_R_cycle REAL DEFAULT 0,
+                updated_at_utc TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT,
+                raw_signal_id INTEGER,
+                signal_time TEXT,
+                direction TEXT,
+                cycle_id TEXT,
+                candidate INTEGER,
+                entry_allowed INTEGER,
+                entry_created INTEGER,
+                candidate_true_last_3 INTEGER,
+                open_before INTEGER,
+                open_after INTEGER,
+                basket_R_before REAL,
+                basket_R_after REAL,
+                high_water_R REAL,
+                giveback_pct REAL,
+                losing_pct REAL,
+                basket_phase TEXT,
+                tide_score INTEGER,
+                tide_status TEXT,
+                manager_action TEXT,
+                manager_detail TEXT,
+                defence_closed_count INTEGER DEFAULT 0,
+                defence_closed_trade_ids TEXT,
+                banked_R_this_hour REAL DEFAULT 0,
+                banked_trade_ids TEXT,
+                note TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_protection_stages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT,
+                updated_at_utc TEXT,
+                direction TEXT,
+                cycle_id TEXT,
+                stage_type TEXT,
+                threshold_R REAL,
+                fraction REAL,
+                status TEXT,
+                target_bank_R REAL,
+                executed_R REAL DEFAULT 0,
+                armed_at_signal_time TEXT,
+                executed_at_signal_time TEXT,
+                selected_trade_ids TEXT,
+                cohort_trade_ids TEXT,
+                reason TEXT,
+                UNIQUE(direction,cycle_id,stage_type,threshold_R)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_stop_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT,
+                signal_time TEXT,
+                direction TEXT,
+                cycle_id TEXT,
+                trade_id TEXT,
+                hold_candles INTEGER,
+                event_type TEXT,
+                rule_stage TEXT,
+                old_stop_price REAL,
+                new_stop_price REAL,
+                protect_fraction REAL,
+                protected_R REAL,
+                note TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bco_live_sim_processed_signals (
+                raw_signal_id INTEGER PRIMARY KEY,
+                signal_time TEXT,
+                processed_at_utc TEXT,
+                policy_version TEXT
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bco_sim_decisions_signal_direction ON bco_live_sim_decisions(raw_signal_id,direction)")
+        for d in ("long", "short"):
+            conn.execute("""
+                INSERT OR IGNORE INTO bco_live_sim_basket_state (
+                    direction,status,open_count,basket_R,basket_pnl,high_water_R,
+                    high_water_pnl,giveback_pct,losing_pct,basket_phase,tide_score,
+                    tide_status,manager_action,updated_at_utc
+                ) VALUES (?, 'FLAT', 0,0,0,0,0,0,0,'FLAT',0,'GREEN','NO_OPEN_BASKET',?)
+            """, (d, now_utc_iso()))
+        conn.commit()
+
+
+def _bco_sim_payload(row: Any) -> Dict[str, Any]:
+    raw = _raw_signal_json(row)
+    return extract_payload(raw) if isinstance(raw, dict) else {}
+
+
+def _bco_sim_ctx8(payload: Dict[str, Any]) -> Dict[str, Any]:
+    contexts = payload.get("contexts")
+    if isinstance(contexts, list):
+        for ctx in contexts:
+            if isinstance(ctx, dict) and safe_str(ctx.get("context_tf") or ctx.get("tf")).upper() == "8H":
+                return ctx
+    return payload if safe_str(payload.get("context_tf")).upper() in {"", "8H"} else {}
+
+
+def _bco_sim_candidate_from_payload(payload: Dict[str, Any], direction: str) -> bool:
+    direction = safe_str(direction).lower()
+    ctx = _bco_sim_ctx8(payload)
+    if direction == "long":
+        candidate = _raw_bool_value(ctx.get("forward_test_candidate"))
+        if "rule_trend_long_v1" in ctx:
+            candidate = candidate and _raw_bool_value(ctx.get("rule_trend_long_v1"))
+        side = _directional_side(payload.get("signal_side") or payload.get("side") or payload.get("direction"))
+        return bool(candidate and side in {"", "long"})
+    return bool(_directional_short_context_candidate(payload, ctx).get("candidate"))
+
+
+def _bco_sim_candidate_support(conn: Any, direction: str, limit: int = 3) -> Dict[str, Any]:
+    rows = conn.execute("""
+        SELECT raw_json FROM raw_signals
+        WHERE UPPER(pair)='BCOUSD'
+        ORDER BY COALESCE(NULLIF(received_at_utc,''), timestamp_readable) DESC, id DESC
+        LIMIT ?
+    """, (int(limit),)).fetchall()
+    vals = [_bco_sim_candidate_from_payload(_bco_sim_payload(r), direction) for r in rows]
+    true_count = sum(1 for x in vals if x)
+    return {
+        "latest_candidate": bool(vals[0]) if vals else False,
+        "candidate_true_last_3": true_count,
+        "supported": bool((vals and vals[0]) or true_count >= 2),
+    }
+
+
+def _bco_sim_directional_metrics(direction: str, entry: float, current: float, highest: float, lowest: float) -> Tuple[float,float,float,float]:
+    if direction == "short":
+        ret = (entry - current) / entry * 100.0
+        mfe = max(0.0, (entry - lowest) / entry * 100.0)
+        mae = min(0.0, (entry - highest) / entry * 100.0)
+    else:
+        ret = (current - entry) / entry * 100.0
+        mfe = max(0.0, (highest - entry) / entry * 100.0)
+        mae = min(0.0, (lowest - entry) / entry * 100.0)
+    r = ret / BCO_LIVE_SIM_SL_PCT
+    return ret, mfe, mae, r
+
+
+def _bco_sim_regime(conn: Any, direction: str) -> str:
+    rows = conn.execute("""
+        SELECT exec_close,exec_high,exec_low FROM raw_signals
+        WHERE UPPER(pair)='BCOUSD' AND exec_close IS NOT NULL
+        ORDER BY COALESCE(NULLIF(received_at_utc,''), timestamp_readable) DESC, id DESC
+        LIMIT 121
+    """).fetchall()
+    if len(rows) < 121:
+        return "unknown"
+    latest = safe_float(rows[0]["exec_close"]); oldest = safe_float(rows[-1]["exec_close"])
+    highs = [safe_float(r["exec_high"]) for r in rows]; lows = [safe_float(r["exec_low"]) for r in rows]
+    highs = [x for x in highs if x is not None]; lows = [x for x in lows if x is not None]
+    if latest is None or oldest is None or oldest <= 0 or not highs or not lows:
+        return "unknown"
+    raw_ret = (latest / oldest - 1.0) * 100.0
+    directional_ret = -raw_ret if direction == "short" else raw_ret
+    rng = (max(highs) / min(lows) - 1.0) * 100.0 if min(lows) > 0 else 0.0
+    if directional_ret >= BCO_LIVE_SIM_SL_PCT:
+        return "strong_favourable"
+    if directional_ret <= -BCO_LIVE_SIM_SL_PCT:
+        return "adverse"
+    if abs(directional_ret) <= BCO_LIVE_SIM_SL_PCT * 0.50 and rng >= BCO_LIVE_SIM_SL_PCT * 1.50:
+        return "flat_choppy"
+    return "normal"
+
+
+def _bco_sim_extension_decision(regime: str, return_pct: float, mfe_pct: float) -> Tuple[bool,List[str]]:
+    ret_r = return_pct / BCO_LIVE_SIM_SL_PCT
+    mfe_r = mfe_pct / BCO_LIVE_SIM_SL_PCT
+    if regime == "adverse":
+        return False, ["directional_regime_adverse"]
+    if regime == "flat_choppy":
+        return False, ["directional_regime_flat_choppy"]
+    if regime == "strong_favourable":
+        min_ret_r, min_mfe_r, max_giveback = 0.0, 0.25, 0.65
+    else:
+        min_ret_r, min_mfe_r, max_giveback = 0.25, 0.75, 0.45
+    reasons: List[str] = []
+    if ret_r < min_ret_r: reasons.append("return_not_strong_enough")
+    if mfe_r < min_mfe_r: reasons.append("mfe_not_strong_enough")
+    if mfe_pct > 0 and (mfe_pct - return_pct) / mfe_pct > max_giveback:
+        reasons.append("too_much_giveback")
+    return (not reasons), reasons
+
+
+def _bco_sim_protect_fraction(hold: int) -> Tuple[float,str]:
+    if hold >= 120: return BCO_LIVE_SIM_PROTECT_120, "120h_plus_late_runner"
+    if hold >= 96: return BCO_LIVE_SIM_PROTECT_96, "96h_plus_mature_runner"
+    if hold >= 72: return BCO_LIVE_SIM_PROTECT_72, "72h_plus_runner"
+    return BCO_LIVE_SIM_PROTECT_48, "48h_plus_runner"
+
+
+def _bco_sim_set_stop(conn: Any, trade: Dict[str, Any], current_price: float, fraction: float, stage: str, signal_time: str, event_type: str) -> bool:
+    entry = float(safe_float(trade.get("entry_price")) or 0.0)
+    old = safe_float(trade.get("managed_stop_price"))
+    if entry <= 0 or current_price <= 0: return False
+    if trade.get("direction") == "short":
+        profit_points = entry - current_price
+        if profit_points <= 0: return False
+        new = entry - profit_points * float(fraction)
+        new = max(new, current_price * 1.0001)
+        min_step = entry * BCO_LIVE_SIM_MIN_STOP_STEP_PCT / 100.0
+        if old is not None and new >= old - min_step: return False
+        protected_r = ((entry - new) / entry * 100.0) / BCO_LIVE_SIM_SL_PCT
+    else:
+        profit_points = current_price - entry
+        if profit_points <= 0: return False
+        new = entry + profit_points * float(fraction)
+        new = min(new, current_price * 0.9999)
+        min_step = entry * BCO_LIVE_SIM_MIN_STOP_STEP_PCT / 100.0
+        if old is not None and new <= old + min_step: return False
+        protected_r = ((new - entry) / entry * 100.0) / BCO_LIVE_SIM_SL_PCT
+    conn.execute("UPDATE bco_live_sim_trades SET managed_stop_price=?,managed_stop_stage=?,updated_at_utc=? WHERE trade_id=?",
+                 (new, stage, now_utc_iso(), trade.get("trade_id")))
+    conn.execute("""
+        INSERT INTO bco_live_sim_stop_events (
+            created_at_utc,signal_time,direction,cycle_id,trade_id,hold_candles,
+            event_type,rule_stage,old_stop_price,new_stop_price,protect_fraction,protected_R,note
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (now_utc_iso(), signal_time, trade.get("direction"), trade.get("cycle_id"), trade.get("trade_id"),
+          int(safe_float(trade.get("hold_candles")) or 0), event_type, stage, old, new, fraction, protected_r,
+          f"Protect approx {fraction:.0%} of current simulated profit; tighten only."))
+    return True
+
+
+def _bco_sim_close_trade(conn: Any, trade: Dict[str, Any], signal_time: str, exit_price: float, reason: str, realized_r: Optional[float] = None) -> float:
+    entry = float(safe_float(trade.get("entry_price")) or 0.0)
+    if realized_r is None:
+        if trade.get("direction") == "short": ret = (entry - exit_price) / entry * 100.0
+        else: ret = (exit_price - entry) / entry * 100.0
+        realized_r = ret / BCO_LIVE_SIM_SL_PCT
+    pnl = float(realized_r) * BCO_LIVE_SIM_RISK_PER_TRADE
+    conn.execute("""
+        UPDATE bco_live_sim_trades
+        SET status='CLOSED',exit_time=?,exit_price=?,exit_reason=?,realized_R=?,realized_pnl=?,
+            current_R=?,current_price=?,updated_at_utc=? WHERE trade_id=?
+    """, (signal_time, exit_price, reason, realized_r, pnl, realized_r, exit_price, now_utc_iso(), trade.get("trade_id")))
+    return float(realized_r)
+
+
+def _bco_sim_update_trade(conn: Any, trade: Dict[str, Any], signal: Any, support: Dict[str,Any]) -> Dict[str, Any]:
+    signal_time = safe_str(signal["timestamp_readable"])
+    current = safe_float(signal["exec_close"]); hi = safe_float(signal["exec_high"]); lo = safe_float(signal["exec_low"])
+    entry = safe_float(trade.get("entry_price"))
+    if not signal_time or current is None or entry is None or entry <= 0:
+        return {"closed": False}
+    hi = float(hi if hi is not None else current); lo = float(lo if lo is not None else current)
+    prev_hi = float(safe_float(trade.get("highest_high")) or entry); prev_lo = float(safe_float(trade.get("lowest_low")) or entry)
+    hold = int(safe_float(trade.get("hold_candles")) or 0) + 1
+    direction = safe_str(trade.get("direction")).lower()
+
+    # Existing managed/cohort stop is active for this candle. It is checked before
+    # the wider hard SL because price would encounter the tighter stop first.
+    managed = safe_float(trade.get("managed_stop_price"))
+    if managed is not None:
+        hit = (direction == "long" and lo <= managed) or (direction == "short" and hi >= managed)
+        if hit:
+            rr = (((managed-entry)/entry)*100.0/BCO_LIVE_SIM_SL_PCT) if direction == "long" else (((entry-managed)/entry)*100.0/BCO_LIVE_SIM_SL_PCT)
+            _bco_sim_close_trade(conn, trade, signal_time, float(managed), f"sim_managed_stop:{safe_str(trade.get('managed_stop_stage'))}", rr)
+            return {"closed": True, "reason": "managed_stop", "R": rr}
+
+    hard = float(safe_float(trade.get("hard_sl_price")) or (entry*(1-BCO_LIVE_SIM_SL_PCT/100.0) if direction=='long' else entry*(1+BCO_LIVE_SIM_SL_PCT/100.0)))
+    hard_hit = (direction == "long" and lo <= hard) or (direction == "short" and hi >= hard)
+    if hard_hit:
+        _bco_sim_close_trade(conn, trade, signal_time, hard, "sim_emergency_sl", -1.0)
+        return {"closed": True, "reason": "emergency_sl", "R": -1.0}
+
+    highest = max(prev_hi, hi); lowest = min(prev_lo, lo)
+    ret, mfe, mae, rr = _bco_sim_directional_metrics(direction, float(entry), float(current), highest, lowest)
+    d48 = safe_str(trade.get("decision_48")); d72 = safe_str(trade.get("decision_72"))
+    exit_now = False; exit_reason = ""
+    regime = _bco_sim_regime(conn, direction)
+
+    if hold >= 48 and not d48:
+        passed, reasons = _bco_sim_extension_decision(regime, ret, mfe)
+        if (not passed) and support.get("supported"):
+            losing_rows = conn.execute("SELECT current_R FROM bco_live_sim_trades WHERE direction=? AND status='OPEN'", (direction,)).fetchall()
+            br = sum(float(safe_float(r["current_R"]) or 0.0) for r in losing_rows)
+            lp = (sum(1 for r in losing_rows if float(safe_float(r["current_R"]) or 0.0) < 0) / len(losing_rows) * 100.0) if losing_rows else 0.0
+            heavy = br <= -2.0 and lp >= 60.0
+            blocked = rr < 0 or regime in {"adverse","flat_choppy"} or heavy or "too_much_giveback" in reasons
+            if not blocked:
+                passed = True; reasons = ["candidate_supported_48h_extension_override"]
+        d48 = "extend" if passed else "exit:"+",".join(reasons)
+        if not passed: exit_now=True; exit_reason="sim_exit_48_no_extension:"+",".join(reasons)
+
+    if hold >= 72 and d48 == "extend" and not d72 and not exit_now:
+        passed, reasons = _bco_sim_extension_decision(regime, ret, mfe)
+        d72 = "extend" if passed else "exit:"+",".join(reasons)
+        if not passed: exit_now=True; exit_reason="sim_exit_72_no_extension:"+",".join(reasons)
+
+    conn.execute("""
+        UPDATE bco_live_sim_trades SET current_price=?,hold_candles=?,highest_high=?,lowest_low=?,
+            return_pct=?,mfe_pct=?,mae_pct=?,current_R=?,decision_48=?,decision_72=?,updated_at_utc=?
+        WHERE trade_id=?
+    """, (current,hold,highest,lowest,ret,mfe,mae,rr,d48,d72,now_utc_iso(),trade.get("trade_id")))
+
+    if exit_now:
+        updated = dict(trade); updated.update({"current_R":rr,"decision_48":d48,"decision_72":d72})
+        _bco_sim_close_trade(conn, updated, signal_time, float(current), exit_reason, rr)
+        return {"closed": True, "reason": exit_reason, "R": rr}
+
+    # v10.1.26-like native runner protection: only profitable 48h+ trades, tighten hourly.
+    if hold >= BCO_LIVE_SIM_MIN_HOLD and rr > 0:
+        fraction, stage = _bco_sim_protect_fraction(hold)
+        refreshed = dict(trade); refreshed.update({"hold_candles":hold,"current_R":rr,"current_price":current})
+        refreshed["managed_stop_price"] = managed
+        _bco_sim_set_stop(conn, refreshed, float(current), fraction, stage, signal_time, "POST48_MANAGED_STOP")
+    return {"closed": False, "R": rr, "hold": hold}
+
+
+def _bco_sim_basket_metrics(conn: Any, direction: str) -> Dict[str, Any]:
+    rows = [dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_trades WHERE direction=? AND status='OPEN' ORDER BY entry_time ASC,id ASC", (direction,)).fetchall()]
+    count = len(rows); basket_r = sum(float(safe_float(r.get("current_R")) or 0.0) for r in rows)
+    losing = sum(1 for r in rows if float(safe_float(r.get("current_R")) or 0.0) < 0)
+    return {"rows":rows,"open_count":count,"basket_R":basket_r,"basket_pnl":basket_r*BCO_LIVE_SIM_RISK_PER_TRADE,"losing_pct":(losing/count*100.0 if count else 0.0),"phase":basket_phase_from_count(count)}
+
+
+def _bco_sim_tide(payload: Dict[str, Any], direction: str, candidate: bool, candidate_true_last_3: int, metrics: Dict[str,Any], high_water_r: float) -> Tuple[int,str,str,List[str],float]:
+    score=0; reasons: List[str]=[]
+    br=float(metrics.get("basket_R") or 0.0); losing=float(metrics.get("losing_pct") or 0.0)
+    giveback=((high_water_r-br)/high_water_r*100.0) if high_water_r>0 and br<high_water_r else 0.0
+    if not candidate: score+=1; reasons.append("latest_candidate_false")
+    if candidate_true_last_3<=1: score+=1; reasons.append("candidate_weak_last_3")
+    if high_water_r>0 and giveback>=40: score+=1; reasons.append("basket_giveback_40pct_plus")
+    if high_water_r>0 and giveback>=60: score+=1; reasons.append("basket_giveback_60pct_plus")
+    if losing>=50: score+=1; reasons.append("majority_trades_losing")
+    if br<=0: score+=1; reasons.append("basket_not_positive")
+    if br<=-2: score+=1; reasons.append("basket_minus_2R_or_worse")
+    ctx=_bco_sim_ctx8(payload)
+    close20 = latest_payload_bool(payload,"exec_close_gt_ema20","close_gt_ema20")
+    close50 = latest_payload_bool(payload,"exec_close_gt_ema50","close_gt_ema50")
+    hist_up = latest_payload_bool(payload,"exec_hist_up","hist_up")
+    rsi_up = latest_payload_bool(payload,"exec_rsi_up","rsi_up")
+    if direction=="short":
+        ctx_stack = latest_payload_bool(ctx,"ctx_bear_stack")
+        daily = latest_payload_bool(payload,"d_bear")
+        if close20 is True: score+=1; reasons.append("price_above_ema20")
+        if close50 is True: score+=1; reasons.append("price_above_ema50")
+        if hist_up is True: score+=1; reasons.append("macd_hist_up_against_short")
+        if rsi_up is True: score+=1; reasons.append("rsi_up_against_short")
+        if ctx_stack is False: score+=1; reasons.append("context_not_bear_stack")
+        if daily is False: score+=1; reasons.append("daily_not_bear")
+    else:
+        ctx_stack = latest_payload_bool(ctx,"ctx_bull_stack")
+        daily = latest_payload_bool(payload,"d_bull")
+        if close20 is False: score+=1; reasons.append("price_below_ema20")
+        if close50 is False: score+=1; reasons.append("price_below_ema50")
+        if hist_up is False: score+=1; reasons.append("macd_hist_not_up")
+        if rsi_up is False: score+=1; reasons.append("rsi_not_up")
+        if ctx_stack is False: score+=1; reasons.append("context_not_bull_stack")
+        if daily is False: score+=1; reasons.append("daily_not_bull")
+    if score<=2: return score,"GREEN","HOLD",reasons,giveback
+    if score<=4: return score,"AMBER","PAUSE_NEW_ENTRIES",reasons,giveback
+    if score<=6: return score,"RED","WOULD_REDUCE_WEAKEST_30_PERCENT",reasons,giveback
+    return score,"CRITICAL","WOULD_CLOSE_FULL_BASKET",reasons,giveback
+
+
+def _bco_sim_execute_defence(conn: Any, direction: str, signal_time: str, current_price: float, action: str, pre_metrics: Dict[str,Any]) -> Dict[str,Any]:
+    frac = suggested_close_fraction_from_action(action)
+    if frac<=0 or not pre_metrics.get("rows"):
+        return {"closed_count":0,"closed_trade_ids":[],"realized_R":0.0}
+    stage=basket_execution_stage(pre_metrics.get("open_count")); maxf=float(stage.get("max_close_fraction") or 0.0)
+    if maxf<=0: return {"closed_count":0,"closed_trade_ids":[],"realized_R":0.0,"blocked_by_stage":stage.get("stage")}
+    if frac>=1.0 and not stage.get("full_close_eligible"): frac=maxf
+    frac=min(frac,maxf)
+    n=pre_metrics.get("open_count") if frac>=1 else max(1,int(round(pre_metrics.get("open_count")*frac)))
+    rows=sorted(list(pre_metrics.get("rows") or []),key=lambda r:float(safe_float(r.get("current_R")) or 0.0))[:n]
+    ids=[]; realized=0.0
+    for t in rows:
+        rr=float(safe_float(t.get("current_R")) or 0.0); realized += _bco_sim_close_trade(conn,t,signal_time,current_price,f"sim_basket_manager:{action}",rr); ids.append(safe_str(t.get("trade_id")))
+    return {"closed_count":len(ids),"closed_trade_ids":ids,"realized_R":realized,"fraction":frac}
+
+
+def _bco_sim_entry_block(action: str, pre_open_count: int, basket_r: float, tide_status: str) -> Tuple[bool,str]:
+    if not live_demo_action_blocks_new_entry(action): return False,"action_does_not_block_entries"
+    if pre_open_count<=0: return False,"flat_basket_entry_block_bypassed"
+    if pre_open_count < JUNE_FULL_DEMO_MIN_OPEN_TRADES_FOR_ENTRY_BLOCK:
+        return (basket_r <= JUNE_FULL_DEMO_ENTRY_BLOCK_TINY_SEVERE_R, "tiny_basket_severe_R_entry_block" if basket_r <= JUNE_FULL_DEMO_ENTRY_BLOCK_TINY_SEVERE_R else "tiny_basket_allow_development")
+    if pre_open_count < JUNE_FULL_DEMO_MIN_OPEN_TRADES_FOR_STRICT_ENTRY_BLOCK:
+        severe = tide_status in {"RED","CRITICAL"} and basket_r <= JUNE_FULL_DEMO_ENTRY_BLOCK_EARLY_SEVERE_R
+        return severe, "early_basket_severe_R_entry_block" if severe else "early_basket_allow_development"
+    return True,"strict_basket_entry_block"
+
+
+def _bco_sim_cycle_state(conn: Any, direction: str, signal_time: str, metrics: Dict[str,Any]) -> Dict[str,Any]:
+    state=dict(conn.execute("SELECT * FROM bco_live_sim_basket_state WHERE direction=?",(direction,)).fetchone() or {})
+    if metrics.get("open_count",0)<=0:
+        return state
+    if not safe_str(state.get("cycle_id")) or safe_str(state.get("status")).upper()=="FLAT":
+        cycle=f"BCOSIM_{direction.upper()}_{clean_cycle_time(signal_time)}"
+        conn.execute("""
+            UPDATE bco_live_sim_basket_state SET cycle_id=?,cycle_started_at=?,status='ACTIVE',
+                high_water_R=0,high_water_pnl=0,high_water_seen_at=?,realized_R_cycle=0,banked_R_cycle=0,updated_at_utc=?
+            WHERE direction=?
+        """,(cycle,signal_time,signal_time,now_utc_iso(),direction))
+        conn.execute("UPDATE bco_live_sim_trades SET cycle_id=? WHERE direction=? AND status='OPEN' AND (cycle_id IS NULL OR cycle_id='')",(cycle,direction))
+        state=dict(conn.execute("SELECT * FROM bco_live_sim_basket_state WHERE direction=?",(direction,)).fetchone())
+    return state
+
+
+def _bco_sim_bank_sort_key(row: Dict[str,Any]) -> Tuple[Any,...]:
+    hold=int(safe_float(row.get("hold_candles")) or 0); rr=float(safe_float(row.get("current_R")) or 0.0)
+    mfe=float(safe_float(row.get("mfe_pct")) or 0.0); ret=float(safe_float(row.get("return_pct")) or 0.0); giveback=max(0.0,mfe-ret)
+    protected=safe_float(row.get("managed_stop_price")) is not None
+    if hold<BCO_LIVE_SIM_MIN_HOLD:
+        return (0,BCO_LIVE_SIM_MIN_HOLD-hold,-giveback,-rr,safe_str(row.get("entry_time")))
+    return (1,1 if protected else 0,-giveback,ret,-rr,safe_str(row.get("entry_time")))
+
+
+def _bco_sim_execute_protection(conn: Any, direction: str, signal_time: str) -> Dict[str,Any]:
+    metrics=_bco_sim_basket_metrics(conn,direction); state=_bco_sim_cycle_state(conn,direction,signal_time,metrics)
+    if metrics["open_count"]<=0 or not safe_str(state.get("cycle_id")):
+        return {"banked_R":0.0,"banked_trade_ids":[],"cohort_updates":0}
+    cycle=safe_str(state.get("cycle_id")); br=float(metrics["basket_R"]); old_hwm=float(safe_float(state.get("high_water_R")) or 0.0)
+    hwm=max(old_hwm,br); hwm_time=signal_time if hwm>old_hwm else safe_str(state.get("high_water_seen_at"))
+    conn.execute("UPDATE bco_live_sim_basket_state SET high_water_R=?,high_water_pnl=?,high_water_seen_at=?,updated_at_utc=? WHERE direction=?",
+                 (hwm,hwm*BCO_LIVE_SIM_RISK_PER_TRADE,hwm_time,now_utc_iso(),direction))
+    banked=0.0; bank_ids=[]; cohort_updates=0
+
+    # Exceptional pre-48h one-shot cohort ratchets, mirroring 150/200/300R live policy.
+    for threshold,fraction in BCO_LIVE_SIM_COHORT_LEVELS:
+        if hwm < threshold: continue
+        row=conn.execute("SELECT * FROM bco_live_sim_protection_stages WHERE direction=? AND cycle_id=? AND stage_type='COHORT' AND threshold_R=?",(direction,cycle,threshold)).fetchone()
+        if row: continue
+        candidates=[r for r in _bco_sim_basket_metrics(conn,direction)["rows"] if int(safe_float(r.get("hold_candles")) or 0)<48 and float(safe_float(r.get("current_R")) or 0.0)>0]
+        ids=[]
+        for t in candidates:
+            current=float(safe_float(t.get("current_price")) or 0.0)
+            if current>0 and _bco_sim_set_stop(conn,t,current,fraction,f"cohort_{int(threshold)}R",signal_time,"PRE48_COHORT_RATCHET"):
+                cohort_updates+=1
+            ids.append(safe_str(t.get("trade_id")))
+        conn.execute("""
+            INSERT OR IGNORE INTO bco_live_sim_protection_stages (
+                created_at_utc,updated_at_utc,direction,cycle_id,stage_type,threshold_R,fraction,status,
+                armed_at_signal_time,executed_at_signal_time,cohort_trade_ids,reason
+            ) VALUES (?,?,?,?,? ,?,?,?,?,?,?,?)
+        """,(now_utc_iso(),now_utc_iso(),direction,cycle,"COHORT",threshold,fraction,"EXECUTED" if ids else "NO_ELIGIBLE",signal_time,signal_time,",".join(ids),"Frozen one-shot pre-48h cohort protection."))
+
+    # Immediate fixed target banking: arm at HWM, bank from any profitable age.
+    for threshold,fraction in BCO_LIVE_SIM_BANK_LEVELS:
+        if hwm < threshold: continue
+        stage=conn.execute("SELECT * FROM bco_live_sim_protection_stages WHERE direction=? AND cycle_id=? AND stage_type='BANK' AND threshold_R=?",(direction,cycle,threshold)).fetchone()
+        if not stage:
+            # Mirror v10.1.26 fixed-at-arm target semantics in R-space. Lower
+            # active banking stages reserve their frozen targets before a higher
+            # stage calculates its own target base, preventing double-counting.
+            lower_rows = conn.execute("""
+                SELECT threshold_R,target_bank_R,status
+                FROM bco_live_sim_protection_stages
+                WHERE direction=? AND cycle_id=? AND stage_type='BANK' AND threshold_R < ?
+                ORDER BY threshold_R ASC
+            """, (direction, cycle, threshold)).fetchall()
+            prior_reserved = sum(
+                float(safe_float(r["target_bank_R"]) or 0.0)
+                for r in lower_rows
+                if safe_str(r["status"]).upper() not in {"EXECUTED", "EXPIRED_FLAT"}
+            )
+            target_base = max(0.0, br - prior_reserved)
+            target = target_base * fraction
+            conn.execute("""
+                INSERT OR IGNORE INTO bco_live_sim_protection_stages (
+                    created_at_utc,updated_at_utc,direction,cycle_id,stage_type,threshold_R,fraction,status,
+                    target_bank_R,armed_at_signal_time,reason
+                ) VALUES (?,?,?,?,? ,?,?,?,?,?,?)
+            """,(now_utc_iso(),now_utc_iso(),direction,cycle,"BANK",threshold,fraction,"ARMED",target,signal_time,
+                  f"Immediate fixed-at-arm target bank; base {target_base:.2f}R after {prior_reserved:.2f}R lower-stage reservations; age does not gate execution."))
+            stage=conn.execute("SELECT * FROM bco_live_sim_protection_stages WHERE direction=? AND cycle_id=? AND stage_type='BANK' AND threshold_R=?",(direction,cycle,threshold)).fetchone()
+        st=dict(stage)
+        if safe_str(st.get("status")).upper() in {"EXECUTED","NO_ELIGIBLE"}: continue
+        target=float(safe_float(st.get("target_bank_R")) or 0.0)
+        eligible=[r for r in _bco_sim_basket_metrics(conn,direction)["rows"] if float(safe_float(r.get("current_R")) or 0.0)>0]
+        ranked=sorted(eligible,key=_bco_sim_bank_sort_key); selected=[]; running=0.0
+        remaining=list(ranked)
+        while remaining and running+0.0001<target:
+            need=target-running
+            finish=[r for r in remaining if float(safe_float(r.get("current_R")) or 0.0)+0.0001>=need]
+            if finish:
+                bucket=min(_bco_sim_bank_sort_key(r)[:2] for r in finish)
+                opts=[r for r in finish if _bco_sim_bank_sort_key(r)[:2]==bucket]
+                pick=min(opts,key=lambda r:(float(safe_float(r.get("current_R")) or 0.0)-need,_bco_sim_bank_sort_key(r)))
+            else: pick=remaining[0]
+            selected.append(pick); running+=float(safe_float(pick.get("current_R")) or 0.0)
+            remaining=[r for r in remaining if r.get("trade_id")!=pick.get("trade_id")]
+        if not selected:
+            conn.execute("UPDATE bco_live_sim_protection_stages SET status='ARMED_WAITING_PROFITABLE_POOL',updated_at_utc=? WHERE id=?",(now_utc_iso(),st.get("id")))
+            continue
+        ids=[]; actual=0.0
+        for t in selected:
+            rr=float(safe_float(t.get("current_R")) or 0.0); price=float(safe_float(t.get("current_price")) or safe_float(t.get("entry_price")) or 0.0)
+            actual += _bco_sim_close_trade(conn,t,signal_time,price,f"sim_immediate_bank_{int(threshold)}R",rr); ids.append(safe_str(t.get("trade_id")))
+        banked+=actual; bank_ids.extend(ids)
+        conn.execute("""
+            UPDATE bco_live_sim_protection_stages SET status='EXECUTED',executed_R=?,executed_at_signal_time=?,
+                selected_trade_ids=?,updated_at_utc=?,reason=? WHERE id=?
+        """,(actual,signal_time,",".join(ids),now_utc_iso(),f"Banked immediately; fixed target {target:.2f}R, whole-trade result {actual:.2f}R.",st.get("id")))
+    if banked:
+        conn.execute("UPDATE bco_live_sim_basket_state SET banked_R_cycle=COALESCE(banked_R_cycle,0)+?,realized_R_cycle=COALESCE(realized_R_cycle,0)+?,updated_at_utc=? WHERE direction=?",
+                     (banked,banked,now_utc_iso(),direction))
+    return {"banked_R":banked,"banked_trade_ids":bank_ids,"cohort_updates":cohort_updates}
+
+
+def _bco_sim_create_trade(conn: Any, signal: Any, direction: str, cycle_id: str) -> Optional[str]:
+    current=safe_float(signal["exec_close"]); signal_time=safe_str(signal["timestamp_readable"])
+    if current is None or current<=0 or not signal_time: return None
+    count=conn.execute("SELECT COUNT(*) AS c FROM bco_live_sim_trades WHERE direction=? AND status='OPEN'",(direction,)).fetchone()["c"]
+    if int(count or 0)>=BCO_LIVE_SIM_MAX_OPEN_PER_DIRECTION: return None
+    tid=f"BCOSIM_{direction.upper()}_{clean_cycle_time(signal_time)}_{int(signal['id'])}"
+    hard=float(current)*(1-BCO_LIVE_SIM_SL_PCT/100.0) if direction=="long" else float(current)*(1+BCO_LIVE_SIM_SL_PCT/100.0)
+    hi=safe_float(signal["exec_high"]) or current; lo=safe_float(signal["exec_low"]) or current
+    conn.execute("""
+        INSERT OR IGNORE INTO bco_live_sim_trades (
+            trade_id,direction,status,cycle_id,entry_signal_id,entry_time,entry_price,current_price,
+            hold_candles,highest_high,lowest_low,return_pct,mfe_pct,mae_pct,current_R,nominal_risk,sl_pct,
+            hard_sl_price,created_at_utc,updated_at_utc
+        ) VALUES (?,?, 'OPEN',?,?,?,?,?,0,?,?,0,0,0,0,?,?,?, ?,?)
+    """,(tid,direction,cycle_id,int(signal["id"]),signal_time,current,current,hi,lo,BCO_LIVE_SIM_RISK_PER_TRADE,BCO_LIVE_SIM_SL_PCT,hard,now_utc_iso(),now_utc_iso()))
+    return tid
+
+
+def bco_live_sim_process_signal(raw_signal_id: int, source: str = "signal_worker") -> Dict[str,Any]:
+    if not BCO_LIVE_SIM_ENABLED:
+        return {"ok":True,"enabled":False,"research_only":True,"reason":"BCO_LIVE_SIM_ENABLED=false"}
+    _bco_sim_init_schema()
+    with _bco_live_sim_lock:
+        with get_conn() as conn:
+            signal=conn.execute("SELECT * FROM raw_signals WHERE id=? AND UPPER(pair)='BCOUSD' LIMIT 1",(int(raw_signal_id),)).fetchone()
+            if not signal: return {"ok":True,"skipped":True,"reason":"not_bco_signal","research_only":True}
+            already = conn.execute("SELECT raw_signal_id FROM bco_live_sim_processed_signals WHERE raw_signal_id=?", (int(raw_signal_id),)).fetchone()
+            if already:
+                return {"ok":True,"skipped":True,"reason":"already_processed","raw_signal_id":int(raw_signal_id),"research_only":True}
+            payload=_bco_sim_payload(signal); signal_time=safe_str(signal["timestamp_readable"]); current=float(safe_float(signal["exec_close"]) or 0.0)
+            result={"ok":True,"enabled":True,"research_only":True,"source":source,"raw_signal_id":raw_signal_id,"signal_time":signal_time,"directions":{}}
+            for direction in ("long","short"):
+                candidate=_bco_sim_candidate_from_payload(payload,direction); support=_bco_sim_candidate_support(conn,direction)
+                # Update every existing trade on every fresh BCO candle.
+                open_start=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_trades WHERE direction=? AND status='OPEN' ORDER BY id ASC",(direction,)).fetchall()]
+                trade_updates=[]
+                for t in open_start: trade_updates.append(_bco_sim_update_trade(conn,t,signal,support))
+                pre=_bco_sim_basket_metrics(conn,direction)
+                state=_bco_sim_cycle_state(conn,direction,signal_time,pre)
+                old_hwm=float(safe_float(state.get("high_water_R")) or 0.0)
+                hwm=max(old_hwm,float(pre.get("basket_R") or 0.0))
+                score,tide_status,shadow_action,reasons,giveback=_bco_sim_tide(payload,direction,candidate,int(support.get("candidate_true_last_3") or 0),pre,hwm)
+                action,detail=calculate_tiered_basket_defence(tide_status,giveback,float(pre.get("losing_pct") or 0.0),float(pre.get("basket_R") or 0.0),int(pre.get("open_count") or 0),candidate,int(support.get("candidate_true_last_3") or 0))
+                defence=_bco_sim_execute_defence(conn,direction,signal_time,current,action,pre)
+                block,block_reason=_bco_sim_entry_block(action,int(pre.get("open_count") or 0),float(pre.get("basket_R") or 0.0),tide_status)
+                entry_created=None
+                if candidate and not block:
+                    post_def=_bco_sim_basket_metrics(conn,direction); state=_bco_sim_cycle_state(conn,direction,signal_time,post_def)
+                    cycle=safe_str(state.get("cycle_id"))
+                    if not cycle:
+                        cycle=f"BCOSIM_{direction.upper()}_{clean_cycle_time(signal_time)}"
+                        conn.execute("UPDATE bco_live_sim_basket_state SET cycle_id=?,cycle_started_at=?,status='ACTIVE',high_water_R=0,high_water_pnl=0,high_water_seen_at=?,updated_at_utc=? WHERE direction=?",(cycle,signal_time,signal_time,now_utc_iso(),direction))
+                    entry_created=_bco_sim_create_trade(conn,signal,direction,cycle)
+                after_entry=_bco_sim_basket_metrics(conn,direction); state=_bco_sim_cycle_state(conn,direction,signal_time,after_entry)
+                protection=_bco_sim_execute_protection(conn,direction,signal_time)
+                after=_bco_sim_basket_metrics(conn,direction); state=dict(conn.execute("SELECT * FROM bco_live_sim_basket_state WHERE direction=?",(direction,)).fetchone())
+                hwm=max(float(safe_float(state.get("high_water_R")) or 0.0),float(after.get("basket_R") or 0.0))
+                gb=((hwm-float(after.get("basket_R") or 0.0))/hwm*100.0) if hwm>0 and float(after.get("basket_R") or 0.0)<hwm else 0.0
+                # Non-bank realised exits this hour are accumulated into cycle realised R.
+                nonbank_realized=sum(float(u.get("R") or 0.0) for u in trade_updates if u.get("closed")) + float(defence.get("realized_R") or 0.0)
+                if nonbank_realized:
+                    conn.execute("UPDATE bco_live_sim_basket_state SET realized_R_cycle=COALESCE(realized_R_cycle,0)+? WHERE direction=?",(nonbank_realized,direction))
+                if after["open_count"]<=0:
+                    conn.execute("""
+                        UPDATE bco_live_sim_basket_state SET status='FLAT',last_signal_time=?,open_count=0,basket_R=0,basket_pnl=0,
+                            cycle_id=NULL,cycle_started_at=NULL,high_water_R=0,high_water_pnl=0,high_water_seen_at=NULL,
+                            giveback_pct=0,losing_pct=0,basket_phase='FLAT',tide_score=?,tide_status=?,manager_action=?,manager_detail=?,
+                            realized_R_cycle=0,banked_R_cycle=0,updated_at_utc=?
+                        WHERE direction=?
+                    """,(signal_time,score,tide_status,action,detail,now_utc_iso(),direction))
+                else:
+                    conn.execute("""
+                        UPDATE bco_live_sim_basket_state SET status='ACTIVE',last_signal_time=?,open_count=?,basket_R=?,basket_pnl=?,
+                            high_water_R=?,high_water_pnl=?,giveback_pct=?,losing_pct=?,basket_phase=?,tide_score=?,tide_status=?,manager_action=?,manager_detail=?,updated_at_utc=?
+                        WHERE direction=?
+                    """,(signal_time,after["open_count"],after["basket_R"],after["basket_pnl"],hwm,hwm*BCO_LIVE_SIM_RISK_PER_TRADE,gb,after["losing_pct"],after["phase"],score,tide_status,action,detail,now_utc_iso(),direction))
+                conn.execute("""
+                    INSERT INTO bco_live_sim_decisions (
+                        created_at_utc,raw_signal_id,signal_time,direction,cycle_id,candidate,entry_allowed,entry_created,
+                        candidate_true_last_3,open_before,open_after,basket_R_before,basket_R_after,high_water_R,giveback_pct,
+                        losing_pct,basket_phase,tide_score,tide_status,manager_action,manager_detail,defence_closed_count,
+                        defence_closed_trade_ids,banked_R_this_hour,banked_trade_ids,note
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,(now_utc_iso(),raw_signal_id,signal_time,direction,safe_str(state.get("cycle_id")),1 if candidate else 0,0 if block else 1,1 if entry_created else 0,
+                      int(support.get("candidate_true_last_3") or 0),pre["open_count"],after["open_count"],pre["basket_R"],after["basket_R"],hwm,gb,after["losing_pct"],after["phase"],score,tide_status,action,detail,
+                      int(defence.get("closed_count") or 0),",".join(defence.get("closed_trade_ids") or []),float(protection.get("banked_R") or 0.0),",".join(protection.get("banked_trade_ids") or []),
+                      f"entry_block={block_reason}; policy={BCO_LIVE_SIM_POLICY_VERSION}"))
+                result["directions"][direction]={"candidate":candidate,"entry_blocked":block,"entry_block_reason":block_reason,"entry_created":entry_created,"open_before":pre["open_count"],"open_after":after["open_count"],"basket_R":after["basket_R"],"high_water_R":hwm,"tide_status":tide_status,"manager_action":action,"defence":defence,"protection":protection}
+            conn.execute("""
+                INSERT OR IGNORE INTO bco_live_sim_processed_signals (raw_signal_id,signal_time,processed_at_utc,policy_version)
+                VALUES (?,?,?,?)
+            """, (int(raw_signal_id), signal_time, now_utc_iso(), BCO_LIVE_SIM_POLICY_VERSION))
+            conn.commit()
+            return result
+
+
+def bco_live_sim_snapshot() -> Dict[str,Any]:
+    _bco_sim_init_schema()
+    with get_conn() as conn:
+        states={safe_str(r["direction"]):dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_basket_state ORDER BY direction").fetchall()}
+        open_trades=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_trades WHERE status='OPEN' ORDER BY direction,hold_candles DESC,id ASC").fetchall()]
+        closed=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_trades WHERE status='CLOSED' ORDER BY id DESC LIMIT 5000").fetchall()]
+        all_trades=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_trades ORDER BY id DESC LIMIT 100000").fetchall()]
+        decisions=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_decisions ORDER BY id DESC LIMIT 100000").fetchall()]
+        stages=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_protection_stages ORDER BY id DESC LIMIT 10000").fetchall()]
+        stops=[dict(r) for r in conn.execute("SELECT * FROM bco_live_sim_stop_events ORDER BY id DESC LIMIT 20000").fetchall()]
+        processed_count=int(conn.execute("SELECT COUNT(*) AS c FROM bco_live_sim_processed_signals").fetchone()["c"] or 0)
+    summaries={}
+    for direction in ("long","short"):
+        dclosed=[r for r in closed if safe_str(r.get("direction"))==direction]
+        realized=sum(float(safe_float(r.get("realized_R")) or 0.0) for r in dclosed)
+        wins=sum(1 for r in dclosed if float(safe_float(r.get("realized_R")) or 0.0)>0)
+        summaries[direction]={"state":states.get(direction,{}),"open_trades":[r for r in open_trades if safe_str(r.get("direction"))==direction],"closed_count":len(dclosed),"realized_R_total":realized,"realized_pnl_total":realized*BCO_LIVE_SIM_RISK_PER_TRADE,"win_rate_pct":(wins/len(dclosed)*100.0 if dclosed else 0.0)}
+    return {"status":"ok","research_only":True,"enabled":BCO_LIVE_SIM_ENABLED,"policy_version":BCO_LIVE_SIM_POLICY_VERSION,"forward_only":True,"broker_connected":False,"risk_per_trade":BCO_LIVE_SIM_RISK_PER_TRADE,"sl_pct":BCO_LIVE_SIM_SL_PCT,"min_hold":BCO_LIVE_SIM_MIN_HOLD,"processed_signal_count":processed_count,"bank_levels":BCO_LIVE_SIM_BANK_LEVELS,"cohort_levels":BCO_LIVE_SIM_COHORT_LEVELS,"managed_stop_fractions":{"48":BCO_LIVE_SIM_PROTECT_48,"72":BCO_LIVE_SIM_PROTECT_72,"96":BCO_LIVE_SIM_PROTECT_96,"120":BCO_LIVE_SIM_PROTECT_120},"directions":summaries,"all_trades":all_trades,"decisions":decisions,"protection_stages":stages,"stop_events":stops,"time_utc":now_utc_iso()}
+
+
+def _bco_sim_money_from_r(r: Any) -> str:
+    return f"£{float(safe_float(r) or 0.0)*BCO_LIVE_SIM_RISK_PER_TRADE:,.2f}"
+
+
+def build_bco_live_sim_dashboard_html() -> str:
+    try: snap=bco_live_sim_snapshot()
+    except Exception as e: return f"<details><summary>BCO Live-Sim Basket Manager</summary><div class='inner neg'>Unavailable: {esc(e)}</div></details>"
+    cards=""; open_rows=""
+    for direction in ("long","short"):
+        info=snap["directions"].get(direction,{}) ; st=info.get("state") or {}; br=float(safe_float(st.get("basket_R")) or 0.0); hwm=float(safe_float(st.get("high_water_R")) or 0.0)
+        cards += f"<div class='card'><div class='label'>BCO {direction.upper()} basket</div><div class='value {'pos' if br>0 else 'neg' if br<0 else ''}>{br:.2f}R</div><div class='small'>{int(st.get('open_count') or 0)} open · {_bco_sim_money_from_r(br)} floating · HWM {hwm:.2f}R · realised {float(info.get('realized_R_total') or 0):.2f}R</div><div class='small'>{esc(st.get('tide_status') or '—')} · {esc(st.get('manager_action') or '—')}</div></div>"
+        for t in info.get("open_trades",[])[:30]:
+            open_rows += f"<tr><td>{direction.upper()}</td><td>{esc(t.get('trade_id'))}</td><td>{esc(t.get('entry_time'))}</td><td>{int(t.get('hold_candles') or 0)}h</td><td>{float(safe_float(t.get('current_R')) or 0):.2f}R</td><td>{float(safe_float(t.get('mfe_pct')) or 0):.2f}%</td><td>{float(safe_float(t.get('mae_pct')) or 0):.2f}%</td><td>{esc(t.get('managed_stop_stage') or '—')}</td><td>{esc(t.get('decision_48') or '—')}</td><td>{esc(t.get('decision_72') or '—')}</td></tr>"
+    if not open_rows: open_rows="<tr><td colspan='10' class='empty'>No forward-sim BCO trades open yet.</td></tr>"
+    dec_rows=""
+    for d in snap.get("decisions",[])[:40]:
+        dec_rows += f"<tr><td>{esc(d.get('signal_time'))}</td><td>{safe_str(d.get('direction')).upper()}</td><td>{'yes' if int(d.get('candidate') or 0) else 'no'}</td><td>{int(d.get('open_after') or 0)}</td><td>{float(safe_float(d.get('basket_R_after')) or 0):.2f}R</td><td>{float(safe_float(d.get('high_water_R')) or 0):.2f}R</td><td>{esc(d.get('tide_status'))}</td><td>{esc(d.get('manager_action'))}</td><td>{int(d.get('defence_closed_count') or 0)}</td><td>{float(safe_float(d.get('banked_R_this_hour')) or 0):.2f}R</td></tr>"
+    if not dec_rows: dec_rows="<tr><td colspan='10' class='empty'>Waiting for the first fresh BCO signal after deployment.</td></tr>"
+    stage_rows=""
+    for st in snap.get("protection_stages",[])[:30]:
+        stage_rows += f"<tr><td>{safe_str(st.get('direction')).upper()}</td><td>{esc(st.get('stage_type'))}</td><td>{float(safe_float(st.get('threshold_R')) or 0):.0f}R</td><td>{float(safe_float(st.get('fraction')) or 0)*100:.0f}%</td><td>{esc(st.get('status'))}</td><td>{float(safe_float(st.get('target_bank_R')) or 0):.2f}R</td><td>{float(safe_float(st.get('executed_R')) or 0):.2f}R</td><td>{esc(st.get('selected_trade_ids') or st.get('cohort_trade_ids') or '—')}</td></tr>"
+    if not stage_rows: stage_rows="<tr><td colspan='8' class='empty'>No 100R+ protection stage has armed yet.</td></tr>"
+    return f"""
+    <details><summary>BCO Live-Sim Basket Manager — Live-Index Behaviour, No Broker</summary><div class='inner'>
+      <div class='note'><strong>Forward-only virtual execution.</strong> Independent LONG and SHORT 8H candidate baskets; £{BCO_LIVE_SIM_RISK_PER_TRADE:.2f}/R; {BCO_LIVE_SIM_SL_PCT:.2f}% emergency SL. Normal trade management starts at 48h, then the basket is assessed every fresh hour. Like live v10.1.26, basket defence and 100/200/300R target banking can override trade age when required.</div>
+      <div class='cards'>{cards}<div class='card'><div class='label'>Protection policy</div><div class='value'>100 / 200 / 300R</div><div class='small'>Immediate bank 20% / 25% / 50% · pre-48 cohort ratchets 150 / 200 / 300R · managed profit protection 25% / 50% / 65% / 75% at 48 / 72 / 96 / 120h.</div></div></div>
+      <details><summary>Open simulated trades</summary><div class='inner'><div class='table-scroll'><table><thead><tr><th>Side</th><th>Trade</th><th>Entry</th><th>Age</th><th>Current R</th><th>MFE</th><th>MAE</th><th>Protection</th><th>48h</th><th>72h</th></tr></thead><tbody>{open_rows}</tbody></table></div></div></details>
+      <details><summary>Recent basket-manager decisions</summary><div class='inner'><div class='table-scroll'><table><thead><tr><th>Signal</th><th>Side</th><th>Candidate</th><th>Open</th><th>Basket R</th><th>HWM</th><th>Tide</th><th>Action</th><th>Defence closes</th><th>Banked</th></tr></thead><tbody>{dec_rows}</tbody></table></div></div></details>
+      <details><summary>Protection / banking stages</summary><div class='inner'><div class='table-scroll'><table><thead><tr><th>Side</th><th>Type</th><th>Threshold</th><th>Fraction</th><th>Status</th><th>Target</th><th>Executed</th><th>Trades</th></tr></thead><tbody>{stage_rows}</tbody></table></div></div></details>
+      <div class='links'><a href='/bco-live-sim'>Live-sim JSON</a><a href='/export/bco-live-sim-trades.csv'>Trades CSV</a><a href='/export/bco-live-sim-decisions.csv'>Decisions CSV</a><a href='/export/bco-live-sim-protection.csv'>Protection CSV</a></div>
+    </div></details>
+    """
+
+
+@app.get("/bco-live-sim")
+def bco_live_sim_route() -> Dict[str,Any]:
+    return bco_live_sim_snapshot()
+
+
+def _bco_sim_csv_response(rows: List[Dict[str,Any]], filename: str) -> Response:
+    return Response(dicts_to_csv(rows),media_type="text/csv",headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+
+
+@app.get("/export/bco-live-sim-trades.csv")
+def export_bco_live_sim_trades_csv() -> Response:
+    return _bco_sim_csv_response(bco_live_sim_snapshot().get("all_trades",[]),"bco-live-sim-trades.csv")
+
+
+@app.get("/export/bco-live-sim-decisions.csv")
+def export_bco_live_sim_decisions_csv() -> Response:
+    return _bco_sim_csv_response(bco_live_sim_snapshot().get("decisions",[]),"bco-live-sim-decisions.csv")
+
+
+@app.get("/export/bco-live-sim-protection.csv")
+def export_bco_live_sim_protection_csv() -> Response:
+    return _bco_sim_csv_response(bco_live_sim_snapshot().get("protection_stages",[]),"bco-live-sim-protection.csv")
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def clean_research_dashboard() -> HTMLResponse:
     init_db()
@@ -24780,6 +25572,7 @@ def clean_research_dashboard() -> HTMLResponse:
     directional=build_directional_research_snapshot(limit=100000)
     bco_directional=_hub_directional_html("BCOUSD", directional)
     jp_directional=_hub_directional_html("NIKKEI", directional)
+    bco_live_sim_html=build_bco_live_sim_dashboard_html()
     html=f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>BCO + JP225 Research Hub</title>
     <style>
@@ -24792,7 +25585,7 @@ def clean_research_dashboard() -> HTMLResponse:
     a{{color:var(--blue);text-decoration:none}} .links a{{display:inline-block;margin:4px 14px 4px 0}} .true,.pos{{color:var(--green)}} .false,.neg{{color:var(--red)}} .empty{{color:var(--muted);padding:10px 0}} .pill{{display:inline-block;padding:4px 8px;border-radius:999px;background:#0f172a;border:1px solid var(--line);font-size:12px;color:var(--muted)}}
     .note{{background:#0f172a;border-left:3px solid var(--blue);padding:10px 12px;color:#cbd5e1;margin:10px 0}} @media(max-width:700px){{.wrap{{padding:12px}}th,td{{font-size:12px}}}}
     </style></head><body><div class='wrap'>
-    <h1>BCO + JP225 Research Hub</h1><div class='sub'>Research only. BCO + JP225 are scored LONG and SHORT at 12/24/48/72/96/120h. No OANDA connection, broker execution, metals, or US-index research.</div>
+    <h1>BCO + JP225 Research Hub</h1><div class='sub'>Research only. BCO + JP225 directional evidence plus a forward-only BCO live-sim basket manager. No OANDA connection, broker execution, metals, or US-index research.</div>
     <div class='cards'>
       <div class='card'><div class='label'>BCO Signals</div><div class='value'>{bco['signals']}</div><div class='small'>Accepted/root candidates: {bco['accepted']} · {esc(bco.get('first_signal') or '—')} → {esc(bco.get('last_signal') or '—')}</div></div>
       <div class='card'><div class='label'>JP225 / Nikkei Signals</div><div class='value'>{jp['signals']}</div><div class='small'>Accepted/root candidates: {jp['accepted']} · {esc(jp.get('first_signal') or '—')} → {esc(jp.get('last_signal') or '—')}</div></div>
@@ -24802,6 +25595,7 @@ def clean_research_dashboard() -> HTMLResponse:
 
     <details open><summary>BCO / Brent Research</summary><div class='inner'>
       <div class='note'>Keep BCO focused on evidence: signal quality, context outcomes, post-48 behaviour, MFE/MAE and weekend-risk work. Live broker/accounting controls have been removed from this dashboard.</div>
+      {bco_live_sim_html}
       {bco_directional}
       <details><summary>Recent BCO signals</summary><div class='inner'>{bco_recent}</div></details>
       <details><summary>BCO post-48 reviews</summary><div class='inner'>{bco_post48}</div></details>
