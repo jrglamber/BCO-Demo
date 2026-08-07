@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO + JP225 Research Hub - v10.1.05 - Research Only"
+APP_NAME = "BCO + JP225 Research Hub - v10.1.06 - Long/Short Directional Research"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "/data/bco_demo_formal_forward.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
@@ -24306,7 +24306,11 @@ def _hub_zip_response(kind: str) -> Response:
                 zf.writestr("oil_weekend_risk_shadow.csv",dicts_to_csv(oil))
         outcomes=[r for r in build_research_context_outcomes(limit=100000,accepted_only=False,candidate_like_only=False) if _hub_norm_asset(r.get("asset"))==asset]
         zf.writestr(f"context-outcomes-{kind}.csv",dicts_to_csv(outcomes))
-        zf.writestr("manifest.json",json.dumps({"kind":kind,"asset":asset,"research_only":True,"generated_at_utc":now_utc_iso(),"history":research_history_status_snapshot()},indent=2,default=str))
+        directional_signal=[r for r in build_directional_signal_outcomes(limit=100000) if _hub_norm_asset(r.get("asset"))==asset]
+        directional_candidates=[r for r in build_directional_candidate_context_outcomes(limit=200000) if _hub_norm_asset(r.get("asset"))==asset]
+        zf.writestr(f"directional-signal-outcomes-{kind}.csv",dicts_to_csv(directional_signal))
+        zf.writestr(f"directional-candidate-context-outcomes-{kind}.csv",dicts_to_csv(directional_candidates))
+        zf.writestr("manifest.json",json.dumps({"kind":kind,"asset":asset,"research_only":True,"directional_research":True,"milestones":DIRECTIONAL_RESEARCH_MILESTONES,"generated_at_utc":now_utc_iso(),"history":research_history_status_snapshot()},indent=2,default=str))
     zip_buffer.seek(0)
     return Response(zip_buffer.getvalue(),media_type="application/zip",headers={"Content-Disposition":f'attachment; filename="{kind}-research.zip"'})
 
@@ -24321,18 +24325,417 @@ def export_clean_jp225_research_zip() -> Response:
     return _hub_zip_response("jp225")
 
 
+
+# ============================================================
+# v10.1.06 - BCO + JP225 LONG/SHORT DIRECTIONAL OUTCOME RESEARCH
+# ============================================================
+# Research-only. This deliberately evaluates BOTH directions from the same raw
+# hourly observations. Nothing here can place, manage or close broker trades.
+#
+# Three evidence views are maintained:
+#   1) COUNTERFACTUAL_ALL: every observation scored as LONG and SHORT.
+#   2) SIGNAL_SIDE: only the direction emitted by the logger (long/short).
+#   3) CANDIDATE_CONTEXT: existing long context-candidate rules plus a transparent
+#      symmetric short research screen (not a trading rule).
+#
+# Hard-stop scoring is conservative: if hourly high/low touches the configured
+# research SL at any point before the horizon, hard_stop_R is recorded as -1R.
+# Intrabar sequencing is unavailable, so this is research evidence rather than
+# broker-fill reconstruction.
+DIRECTIONAL_RESEARCH_MILESTONES = [12, 24, 48, 72, 96, 120]
+DIRECTIONAL_SHORT_CTX_ATR_THRESHOLD_PCT = 0.53
+
+
+def _directional_side(value: Any) -> str:
+    s = safe_str(value).lower()
+    if s in {"long", "buy"}:
+        return "long"
+    if s in {"short", "sell"}:
+        return "short"
+    return "neutral" if s else ""
+
+
+def _directional_return_pct(direction: str, entry: float, target: float) -> Optional[float]:
+    if entry is None or entry == 0 or target is None:
+        return None
+    if direction == "short":
+        return (entry - target) / entry * 100.0
+    return (target - entry) / entry * 100.0
+
+
+def _directional_mfe_mae(direction: str, entry: float, highs: List[float], lows: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    if entry is None or entry == 0:
+        return None, None
+    if direction == "short":
+        mfe = max(0.0, ((entry - min(lows)) / entry * 100.0)) if lows else None
+        mae = min(0.0, ((entry - max(highs)) / entry * 100.0)) if highs else None
+        return mfe, mae
+    mfe = max(0.0, ((max(highs) - entry) / entry * 100.0)) if highs else None
+    mae = min(0.0, ((min(lows) - entry) / entry * 100.0)) if lows else None
+    return mfe, mae
+
+
+def _directional_to_r(asset: str, return_pct_value: Any) -> Optional[float]:
+    v = safe_float(return_pct_value)
+    sl = research_context_sl_pct(asset)
+    if v is None or sl <= 0:
+        return None
+    return v / sl
+
+
+def _directional_short_context_candidate(raw: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Symmetric, non-optimised SHORT research screen.
+
+    Mirrors the logger's two long context rules rather than fitting a new rule:
+      - trend short: signal_side=short, context ATR >= 0.53, 1H trend bear, not range
+      - bear continuation: signal_side=short, 1H trend bear, context trend bear,
+        1H close below EMA20
+    This is explicitly research-only and does not alter the Pine alert or any broker path.
+    """
+    side = _directional_side(raw.get("signal_side"))
+    exec_trend = safe_str(raw.get("exec_trend_state")).lower()
+    ctx_trend = safe_str(ctx.get("ctx_trend_state")).lower()
+    ctx_atr = safe_float(ctx.get("ctx_atr_pct"))
+    ctx_is_range = _raw_bool_value(ctx.get("ctx_is_range"))
+    exec_close_gt_ema20_present = "exec_close_gt_ema20" in raw and safe_str(raw.get("exec_close_gt_ema20")) != ""
+    exec_close_gt_ema20 = _raw_bool_value(raw.get("exec_close_gt_ema20"))
+    trend_short = bool(
+        side == "short"
+        and ctx_atr is not None
+        and ctx_atr >= DIRECTIONAL_SHORT_CTX_ATR_THRESHOLD_PCT
+        and exec_trend == "bear"
+        and not ctx_is_range
+    )
+    bear_continuation = bool(
+        side == "short"
+        and exec_trend == "bear"
+        and ctx_trend == "bear"
+        and exec_close_gt_ema20_present
+        and not exec_close_gt_ema20
+    )
+    return {
+        "candidate": 1 if (trend_short or bear_continuation) else 0,
+        "rule_trend_short_symmetric_v1": 1 if trend_short else 0,
+        "rule_bear_continuation_symmetric_v1": 1 if bear_continuation else 0,
+    }
+
+
+def _directional_raw_rows() -> Dict[str, List[Any]]:
+    init_db()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, received_at_utc, pair, timestamp_readable, exec_close, exec_high, exec_low,
+                   forward_test_candidate, take_trade, raw_json
+            FROM raw_signals
+            WHERE UPPER(pair) IN ('BCOUSD','BCO','UKOIL','BRENT','NIKKEI','JP225','JPN225')
+            ORDER BY UPPER(pair) ASC, id ASC
+        """).fetchall()
+    by_asset: Dict[str, List[Any]] = {"BCOUSD": [], "NIKKEI": []}
+    for row in rows:
+        a = _hub_norm_asset(row["pair"])
+        if a in by_asset:
+            by_asset[a].append(row)
+    return by_asset
+
+
+def build_directional_signal_outcomes(limit: int = 100000) -> List[Dict[str, Any]]:
+    """Score every BCO/Nikkei hourly observation in both directions."""
+    limit = max(1, min(int(limit or 100000), 250000))
+    by_asset = _directional_raw_rows()
+    out: List[Dict[str, Any]] = []
+    for asset, items in by_asset.items():
+        for idx, row in enumerate(items):
+            raw = _raw_signal_json(row)
+            entry = safe_float(row["exec_close"])
+            emitted_side = _directional_side(raw.get("signal_side") or raw.get("side") or raw.get("direction"))
+            root_candidate = _raw_bool_value(row["forward_test_candidate"])
+            for direction in ("long", "short"):
+                d: Dict[str, Any] = {
+                    "signal_id": int(row["id"]),
+                    "asset": asset,
+                    "asset_label": research_asset_label(asset),
+                    "candle_time": row["timestamp_readable"],
+                    "candle_time_display": display_candle_time(row["timestamp_readable"]),
+                    "received_at_utc": row["received_at_utc"],
+                    "direction": direction,
+                    "signal_side": emitted_side,
+                    "signal_side_match": 1 if emitted_side == direction else 0,
+                    "root_long_candidate": 1 if root_candidate else 0,
+                    "score": raw.get("score_raw", ""),
+                    "signal_quality": raw.get("signal_quality", ""),
+                    "setup_type": raw.get("setup_type", ""),
+                    "exec_trend_state": raw.get("exec_trend_state", ""),
+                    "d_bull": raw.get("d_bull", ""),
+                    "d_bear": raw.get("d_bear", ""),
+                    "entry_close": entry,
+                    "research_sl_pct": research_context_sl_pct(asset),
+                }
+                for h in DIRECTIONAL_RESEARCH_MILESTONES:
+                    d[f"has_{h}h"] = 0
+                    for k in ("return_pct", "R", "mfe_pct", "mae_pct", "hard_stop_R"):
+                        d[f"{k}_{h}h"] = None
+                    d[f"stop_hit_{h}h"] = 0
+                    if entry is None or entry == 0:
+                        continue
+                    future = items[idx + 1: idx + h + 1]
+                    if len(future) < h:
+                        continue
+                    target = safe_float(future[-1]["exec_close"])
+                    highs = [safe_float(x["exec_high"]) for x in future]
+                    lows = [safe_float(x["exec_low"]) for x in future]
+                    highs = [float(x) for x in highs if x is not None]
+                    lows = [float(x) for x in lows if x is not None]
+                    ret = _directional_return_pct(direction, float(entry), target) if target is not None else None
+                    mfe, mae = _directional_mfe_mae(direction, float(entry), highs, lows)
+                    r_val = _directional_to_r(asset, ret)
+                    stop_hit = bool(mae is not None and mae <= -abs(research_context_sl_pct(asset)))
+                    hard_stop_r = -1.0 if stop_hit else r_val
+                    d[f"return_pct_{h}h"] = ret
+                    d[f"R_{h}h"] = r_val
+                    d[f"mfe_pct_{h}h"] = mfe
+                    d[f"mae_pct_{h}h"] = mae
+                    d[f"stop_hit_{h}h"] = 1 if stop_hit else 0
+                    d[f"hard_stop_R_{h}h"] = hard_stop_r
+                    d[f"has_{h}h"] = 1
+                out.append(d)
+    out.sort(key=lambda r: (int(r.get("signal_id") or 0), 1 if r.get("direction") == "long" else 0), reverse=True)
+    return out[:limit]
+
+
+def build_directional_candidate_context_outcomes(limit: int = 200000) -> List[Dict[str, Any]]:
+    """Context-level LONG and symmetric SHORT candidate outcomes."""
+    limit = max(1, min(int(limit or 200000), 400000))
+    by_asset = _directional_raw_rows()
+    out: List[Dict[str, Any]] = []
+    for asset, items in by_asset.items():
+        for idx, row in enumerate(items):
+            raw = _raw_signal_json(row)
+            entry = safe_float(row["exec_close"])
+            emitted_side = _directional_side(raw.get("signal_side") or raw.get("side") or raw.get("direction"))
+            contexts = _research_context_variants(raw)
+            for ctx in contexts:
+                ctx_tf = safe_str(ctx.get("context_tf") or ctx.get("tf")).upper()
+                short_info = _directional_short_context_candidate(raw, ctx)
+                for direction in ("long", "short"):
+                    long_candidate = _raw_bool_value(ctx.get("forward_test_candidate"))
+                    candidate = long_candidate if direction == "long" else bool(short_info["candidate"])
+                    d: Dict[str, Any] = {
+                        "scenario_id": f"{row['id']}_{ctx_tf}_{direction}",
+                        "signal_id": int(row["id"]),
+                        "asset": asset,
+                        "asset_label": research_asset_label(asset),
+                        "context_tf": ctx_tf,
+                        "direction": direction,
+                        "candidate_for_direction": 1 if candidate else 0,
+                        "signal_side": emitted_side,
+                        "signal_side_match": 1 if emitted_side == direction else 0,
+                        "long_candidate_existing_rule": 1 if long_candidate else 0,
+                        "short_candidate_symmetric_rule": int(short_info["candidate"]),
+                        "rule_trend_short_symmetric_v1": int(short_info["rule_trend_short_symmetric_v1"]),
+                        "rule_bear_continuation_symmetric_v1": int(short_info["rule_bear_continuation_symmetric_v1"]),
+                        "candle_time": row["timestamp_readable"],
+                        "candle_time_display": display_candle_time(row["timestamp_readable"]),
+                        "entry_close": entry,
+                        "research_sl_pct": research_context_sl_pct(asset),
+                        "score": raw.get("score_raw", ""),
+                        "signal_quality": raw.get("signal_quality", ""),
+                        "setup_type": raw.get("setup_type", ""),
+                        "exec_trend_state": raw.get("exec_trend_state", ""),
+                        "ctx_trend_state": ctx.get("ctx_trend_state", ""),
+                        "ctx_atr_pct": ctx.get("ctx_atr_pct", ""),
+                        "ctx_rsi": ctx.get("ctx_rsi", ""),
+                    }
+                    for h in DIRECTIONAL_RESEARCH_MILESTONES:
+                        d[f"has_{h}h"] = 0
+                        for k in ("return_pct", "R", "mfe_pct", "mae_pct", "hard_stop_R"):
+                            d[f"{k}_{h}h"] = None
+                        d[f"stop_hit_{h}h"] = 0
+                        if entry is None or entry == 0:
+                            continue
+                        future = items[idx + 1: idx + h + 1]
+                        if len(future) < h:
+                            continue
+                        target = safe_float(future[-1]["exec_close"])
+                        highs = [safe_float(x["exec_high"]) for x in future]
+                        lows = [safe_float(x["exec_low"]) for x in future]
+                        highs = [float(x) for x in highs if x is not None]
+                        lows = [float(x) for x in lows if x is not None]
+                        ret = _directional_return_pct(direction, float(entry), target) if target is not None else None
+                        mfe, mae = _directional_mfe_mae(direction, float(entry), highs, lows)
+                        r_val = _directional_to_r(asset, ret)
+                        stop_hit = bool(mae is not None and mae <= -abs(research_context_sl_pct(asset)))
+                        d[f"return_pct_{h}h"] = ret
+                        d[f"R_{h}h"] = r_val
+                        d[f"mfe_pct_{h}h"] = mfe
+                        d[f"mae_pct_{h}h"] = mae
+                        d[f"stop_hit_{h}h"] = 1 if stop_hit else 0
+                        d[f"hard_stop_R_{h}h"] = -1.0 if stop_hit else r_val
+                        d[f"has_{h}h"] = 1
+                    out.append(d)
+    out.sort(key=lambda r: (int(r.get("signal_id") or 0), safe_str(r.get("context_tf")), safe_str(r.get("direction"))), reverse=True)
+    return out[:limit]
+
+
+def _directional_median(vals: List[float]) -> Optional[float]:
+    vals = sorted(float(x) for x in vals if x is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def summarise_directional_outcomes(rows: List[Dict[str, Any]], group_fields: List[str]) -> List[Dict[str, Any]]:
+    groups: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = tuple(safe_str(row.get(f)).upper() for f in group_fields)
+        groups.setdefault(key, []).append(row)
+    out: List[Dict[str, Any]] = []
+    for key, subset in sorted(groups.items()):
+        s: Dict[str, Any] = {f: key[i] for i, f in enumerate(group_fields)}
+        s["rows"] = len(subset)
+        for h in DIRECTIONAL_RESEARCH_MILESTONES:
+            matured = [r for r in subset if int(r.get(f"has_{h}h") or 0) == 1 and safe_float(r.get(f"R_{h}h")) is not None]
+            raw_rs = [float(safe_float(r.get(f"R_{h}h"))) for r in matured if safe_float(r.get(f"R_{h}h")) is not None]
+            hs_rs = [float(safe_float(r.get(f"hard_stop_R_{h}h"))) for r in matured if safe_float(r.get(f"hard_stop_R_{h}h")) is not None]
+            mfes = [float(safe_float(r.get(f"mfe_pct_{h}h"))) for r in matured if safe_float(r.get(f"mfe_pct_{h}h")) is not None]
+            maes = [float(safe_float(r.get(f"mae_pct_{h}h"))) for r in matured if safe_float(r.get(f"mae_pct_{h}h")) is not None]
+            s[f"n_{h}h"] = len(raw_rs)
+            s[f"avg_R_{h}h"] = sum(raw_rs) / len(raw_rs) if raw_rs else None
+            s[f"median_R_{h}h"] = _directional_median(raw_rs)
+            s[f"win_rate_{h}h_pct"] = (sum(1 for v in raw_rs if v > 0) / len(raw_rs) * 100.0) if raw_rs else None
+            s[f"stop_hit_rate_{h}h_pct"] = (sum(int(r.get(f"stop_hit_{h}h") or 0) for r in matured) / len(matured) * 100.0) if matured else None
+            s[f"hard_stop_avg_R_{h}h"] = sum(hs_rs) / len(hs_rs) if hs_rs else None
+            s[f"hard_stop_median_R_{h}h"] = _directional_median(hs_rs)
+            s[f"hard_stop_win_rate_{h}h_pct"] = (sum(1 for v in hs_rs if v > 0) / len(hs_rs) * 100.0) if hs_rs else None
+            s[f"avg_mfe_{h}h_pct"] = sum(mfes) / len(mfes) if mfes else None
+            s[f"avg_mae_{h}h_pct"] = sum(maes) / len(maes) if maes else None
+        out.append(s)
+    return out
+
+
+def build_directional_research_snapshot(limit: int = 100000) -> Dict[str, Any]:
+    signal_rows = build_directional_signal_outcomes(limit=limit)
+    context_rows = build_directional_candidate_context_outcomes(limit=min(limit * 4, 400000))
+    counterfactual = summarise_directional_outcomes(signal_rows, ["asset", "direction"])
+    signal_side_rows = [r for r in signal_rows if int(r.get("signal_side_match") or 0) == 1]
+    signal_side = summarise_directional_outcomes(signal_side_rows, ["asset", "direction"])
+    candidate_rows = [r for r in context_rows if int(r.get("candidate_for_direction") or 0) == 1]
+    candidate_context = summarise_directional_outcomes(candidate_rows, ["asset", "context_tf", "direction"])
+    return {
+        "status": "ok",
+        "research_only": True,
+        "milestones": DIRECTIONAL_RESEARCH_MILESTONES,
+        "short_candidate_rule": {
+            "name": "symmetric_short_v1_research_only",
+            "ctx_atr_threshold_pct": DIRECTIONAL_SHORT_CTX_ATR_THRESHOLD_PCT,
+            "note": "Mirrors the logger long rules. It is not a live/demo trading rule.",
+        },
+        "counterfactual_all_summary": counterfactual,
+        "signal_side_summary": signal_side,
+        "candidate_context_summary": candidate_context,
+        "signal_rows": signal_rows,
+        "candidate_context_rows": context_rows,
+        "time_utc": now_utc_iso(),
+    }
+
+
+@app.get("/directional-research")
+def directional_research(limit: int = 100000) -> Dict[str, Any]:
+    snap = build_directional_research_snapshot(limit=limit)
+    # Keep JSON useful rather than returning hundreds of thousands of detail rows.
+    return {
+        "status": snap["status"],
+        "research_only": True,
+        "milestones": snap["milestones"],
+        "short_candidate_rule": snap["short_candidate_rule"],
+        "counterfactual_all_summary": snap["counterfactual_all_summary"],
+        "signal_side_summary": snap["signal_side_summary"],
+        "candidate_context_summary": snap["candidate_context_summary"],
+        "detail_counts": {
+            "signal_direction_rows": len(snap["signal_rows"]),
+            "candidate_context_direction_rows": len(snap["candidate_context_rows"]),
+        },
+        "time_utc": snap["time_utc"],
+    }
+
+
+@app.get("/export/directional-signal-outcomes.csv")
+def export_directional_signal_outcomes_csv(limit: int = 100000) -> Response:
+    rows = build_directional_signal_outcomes(limit=limit)
+    return Response(dicts_to_csv(rows), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=directional-signal-outcomes.csv"})
+
+
+@app.get("/export/directional-candidate-context-outcomes.csv")
+def export_directional_candidate_context_outcomes_csv(limit: int = 200000) -> Response:
+    rows = build_directional_candidate_context_outcomes(limit=limit)
+    return Response(dicts_to_csv(rows), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=directional-candidate-context-outcomes.csv"})
+
+
+def _directional_summary_table_html(rows: List[Dict[str, Any]], candidate_context: bool = False) -> str:
+    if not rows:
+        return '<div class="empty">No matured long/short outcomes yet.</div>'
+    body: List[str] = []
+    for r in rows:
+        direction = safe_str(r.get("direction")).upper()
+        context_cell = f"<td><strong>{esc(r.get('context_tf'))}</strong></td>" if candidate_context else ""
+        body.append(
+            "<tr>"
+            + context_cell
+            + f"<td><strong>{esc(direction)}</strong></td>"
+            + f"<td>{esc(r.get('rows',0))}</td>"
+            + f"<td>{esc(r.get('n_48h',0))}</td>"
+            + f"<td class='{pnl_class(r.get('avg_R_48h'))}'>{_hub_fmt(r.get('avg_R_48h'),2,'R')}</td>"
+            + f"<td>{_hub_fmt(r.get('win_rate_48h_pct'),1,'%')}</td>"
+            + f"<td>{_hub_fmt(r.get('stop_hit_rate_48h_pct'),1,'%')}</td>"
+            + f"<td class='{pnl_class(r.get('hard_stop_avg_R_48h'))}'><strong>{_hub_fmt(r.get('hard_stop_avg_R_48h'),2,'R')}</strong></td>"
+            + f"<td class='{pnl_class(r.get('hard_stop_avg_R_72h'))}'>{_hub_fmt(r.get('hard_stop_avg_R_72h'),2,'R')}</td>"
+            + f"<td class='{pnl_class(r.get('hard_stop_avg_R_96h'))}'>{_hub_fmt(r.get('hard_stop_avg_R_96h'),2,'R')}</td>"
+            + f"<td class='{pnl_class(r.get('hard_stop_avg_R_120h'))}'>{_hub_fmt(r.get('hard_stop_avg_R_120h'),2,'R')}</td>"
+            + f"<td>{_hub_fmt(r.get('avg_mfe_48h_pct'),2,'%')}</td>"
+            + f"<td>{_hub_fmt(r.get('avg_mae_48h_pct'),2,'%')}</td>"
+            + "</tr>"
+        )
+    context_head = "<th>Context</th>" if candidate_context else ""
+    return (
+        '<div class="table-scroll"><table><thead><tr>' + context_head
+        + '<th>Direction</th><th>Rows</th><th>48h N</th><th>48h Raw Avg</th><th>48h Raw Win</th><th>48h SL Hit</th><th>48h Hard-stop Avg</th><th>72h Hard-stop Avg</th><th>96h Hard-stop Avg</th><th>120h Hard-stop Avg</th><th>48h Avg MFE</th><th>48h Avg MAE</th></tr></thead><tbody>'
+        + ''.join(body) + '</tbody></table></div>'
+    )
+
+
+def _hub_directional_html(asset: str, snap: Dict[str, Any]) -> str:
+    asset = _hub_norm_asset(asset)
+    all_rows = [r for r in snap.get("counterfactual_all_summary", []) if _hub_norm_asset(r.get("asset")) == asset]
+    side_rows = [r for r in snap.get("signal_side_summary", []) if _hub_norm_asset(r.get("asset")) == asset]
+    candidate_rows = [r for r in snap.get("candidate_context_summary", []) if _hub_norm_asset(r.get("asset")) == asset]
+    return f"""
+      <h3>Long vs Short — all hourly observations</h3>
+      <div class='small'>Counterfactual view: every stored hourly observation is scored both LONG and SHORT. This is useful for discovering directional asymmetry without changing the alert rules.</div>
+      {_directional_summary_table_html(all_rows)}
+      <details><summary>Signal-side performance</summary><div class='inner'>
+        <div class='small'>Only rows where the logger actually emitted LONG or SHORT. Neutral observations are excluded.</div>
+        {_directional_summary_table_html(side_rows)}
+      </div></details>
+      <details open><summary>Candidate performance by context and direction</summary><div class='inner'>
+        <div class='small'>LONG uses the existing per-context candidate rules. SHORT uses a symmetric research-only inversion of those rules (0.53% context ATR threshold); it is not an execution rule.</div>
+        {_directional_summary_table_html(candidate_rows, candidate_context=True)}
+      </div></details>
+    """
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def clean_research_dashboard() -> HTMLResponse:
     init_db()
     status=research_history_status_snapshot()
     bco=status["bco"]; jp=status["jp225"]
-    bco_context=_hub_context_summary_html("BCOUSD")
-    jp_context=_hub_context_summary_html("NIKKEI")
     bco_recent=_hub_recent_raw_html("BCOUSD",20)
     jp_recent=_hub_recent_raw_html("NIKKEI",20)
     bco_post48=_hub_bco_post48_html(20)
     bco_milestones=_hub_bco_milestones_html(20)
     oil_weekend=_hub_oil_weekend_html(12)
+    directional=build_directional_research_snapshot(limit=100000)
+    bco_directional=_hub_directional_html("BCOUSD", directional)
+    jp_directional=_hub_directional_html("NIKKEI", directional)
     html=f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
     <title>BCO + JP225 Research Hub</title>
     <style>
@@ -24345,7 +24748,7 @@ def clean_research_dashboard() -> HTMLResponse:
     a{{color:var(--blue);text-decoration:none}} .links a{{display:inline-block;margin:4px 14px 4px 0}} .true,.pos{{color:var(--green)}} .false,.neg{{color:var(--red)}} .empty{{color:var(--muted);padding:10px 0}} .pill{{display:inline-block;padding:4px 8px;border-radius:999px;background:#0f172a;border:1px solid var(--line);font-size:12px;color:var(--muted)}}
     .note{{background:#0f172a;border-left:3px solid var(--blue);padding:10px 12px;color:#cbd5e1;margin:10px 0}} @media(max-width:700px){{.wrap{{padding:12px}}th,td{{font-size:12px}}}}
     </style></head><body><div class='wrap'>
-    <h1>BCO + JP225 Research Hub</h1><div class='sub'>Research only. No OANDA connection, broker execution, live-account controls, metals, or US-index research.</div>
+    <h1>BCO + JP225 Research Hub</h1><div class='sub'>Research only. BCO + JP225 are scored LONG and SHORT at 12/24/48/72/96/120h. No OANDA connection, broker execution, metals, or US-index research.</div>
     <div class='cards'>
       <div class='card'><div class='label'>BCO Signals</div><div class='value'>{bco['signals']}</div><div class='small'>Accepted/root candidates: {bco['accepted']} · {esc(bco.get('first_signal') or '—')} → {esc(bco.get('last_signal') or '—')}</div></div>
       <div class='card'><div class='label'>JP225 / Nikkei Signals</div><div class='value'>{jp['signals']}</div><div class='small'>Accepted/root candidates: {jp['accepted']} · {esc(jp.get('first_signal') or '—')} → {esc(jp.get('last_signal') or '—')}</div></div>
@@ -24355,7 +24758,7 @@ def clean_research_dashboard() -> HTMLResponse:
 
     <details open><summary>BCO / Brent Research</summary><div class='inner'>
       <div class='note'>Keep BCO focused on evidence: signal quality, context outcomes, post-48 behaviour, MFE/MAE and weekend-risk work. Live broker/accounting controls have been removed from this dashboard.</div>
-      <h3>Accepted multi-context outcomes</h3>{bco_context}
+      {bco_directional}
       <details><summary>Recent BCO signals</summary><div class='inner'>{bco_recent}</div></details>
       <details><summary>BCO post-48 reviews</summary><div class='inner'>{bco_post48}</div></details>
       <details><summary>BCO milestone / MFE / MAE snapshots</summary><div class='inner'>{bco_milestones}</div></details>
@@ -24364,7 +24767,7 @@ def clean_research_dashboard() -> HTMLResponse:
 
     <details open><summary>JP225 / Nikkei Research</summary><div class='inner'>
       <div class='note'>The single hourly JP225 logger carries long/short/neutral execution state plus 2H, 4H, 8H and 12H context. This section is research-only and does not create broker trades.</div>
-      <h3>Accepted multi-context outcomes</h3>{jp_context}
+      {jp_directional}
       <details><summary>Recent JP225 / Nikkei signals</summary><div class='inner'>{jp_recent}</div></details>
       <div class='links'><a href='/nikkei-deep-research'>Nikkei deep-research JSON</a><a href='/export/nikkei-deep-research.csv'>Nikkei deep-research CSV</a></div>
     </div></details>
@@ -24375,7 +24778,7 @@ def clean_research_dashboard() -> HTMLResponse:
         <div class='card'><div class='label'>JP225 Stored History</div><div class='value'>{jp['signals']}</div><div class='small'>Data is merged by signal ID; imports are additive and idempotent.</div></div>
         <div class='card'><div class='label'>Main-project import</div><div class='value'>{'READY' if status['import_enabled'] and status['import_source_configured'] else 'OFF'}</div><div class='small'>Enable only for the one-time history recovery, then turn it off.</div></div>
       </div>
-      <div class='links'><a href='/research-history-status'>History status JSON</a><a href='/export/bco-research.zip'>Download BCO research ZIP</a><a href='/export/jp225-research.zip'>Download JP225 research ZIP</a></div>
+      <div class='links'><a href='/research-history-status'>History status JSON</a><a href='/directional-research'>Directional scorecard JSON</a><a href='/export/directional-signal-outcomes.csv'>Long/short signal outcomes CSV</a><a href='/export/directional-candidate-context-outcomes.csv'>Directional candidates CSV</a><a href='/export/bco-research.zip'>Download BCO research ZIP</a><a href='/export/jp225-research.zip'>Download JP225 research ZIP</a></div>
       <div class='note'>History import never deletes existing rows. It imports only missing BCO/JP225 records from the live project and skips duplicates. Active broker state is not imported.</div>
     </div></details>
 
