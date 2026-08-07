@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 
-APP_NAME = "BCO + JP225 Research Hub - v10.1.06 - Long/Short Directional Research"
+APP_NAME = "BCO + JP225 Research Hub - v10.1.07 - Directional Chronology Fix"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "/data/bco_demo_formal_forward.sqlite")
 BCO_STANDALONE_MODE = os.getenv("BCO_STANDALONE_MODE", "true").strip().lower() == "true"
@@ -24327,7 +24327,9 @@ def export_clean_jp225_research_zip() -> Response:
 
 
 # ============================================================
-# v10.1.06 - BCO + JP225 LONG/SHORT DIRECTIONAL OUTCOME RESEARCH
+# v10.1.07 - BCO + JP225 LONG/SHORT DIRECTIONAL OUTCOME RESEARCH
+# Chronology fix: imported history IDs are not chronological, so all forward
+# outcome windows are ordered by received_at_utc and reject abnormal >72h gaps.
 # ============================================================
 # Research-only. This deliberately evaluates BOTH directions from the same raw
 # hourly observations. Nothing here can place, manage or close broker trades.
@@ -24343,6 +24345,10 @@ def export_clean_jp225_research_zip() -> Response:
 # Intrabar sequencing is unavailable, so this is research evidence rather than
 # broker-fill reconstruction.
 DIRECTIONAL_RESEARCH_MILESTONES = [12, 24, 48, 72, 96, 120]
+DIRECTIONAL_MAX_SEQUENCE_GAP_HOURS = max(
+    55.0,
+    min(float(os.getenv("DIRECTIONAL_MAX_SEQUENCE_GAP_HOURS", "72")), 168.0),
+)
 DIRECTIONAL_SHORT_CTX_ATR_THRESHOLD_PCT = 0.53
 
 
@@ -24420,6 +24426,42 @@ def _directional_short_context_candidate(raw: Dict[str, Any], ctx: Dict[str, Any
     }
 
 
+def _directional_row_time(row: Any) -> datetime:
+    """Chronological key for directional research.
+
+    History migrated from the main service retained its original timestamps but
+    not chronological SQLite ids. received_at_utc is therefore the authoritative
+    ordering key; timestamp_readable is only a fallback.
+    """
+    dt = parse_dt(row["received_at_utc"])
+    if dt is not None:
+        return dt.astimezone(timezone.utc)
+    dt = parse_signal_candle_dt(row["timestamp_readable"])
+    if dt is not None:
+        return dt.astimezone(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _directional_future_window(items: List[Any], idx: int, horizon: int) -> List[Any]:
+    """Return the next N research bars only when the sequence is continuous.
+
+    Normal weekend closures in these feeds are roughly 50-54h, so the default
+    72h guard keeps weekends valid while preventing a long data outage from being
+    treated as if the next received alert were the next hourly candle.
+    """
+    future = items[idx + 1: idx + int(horizon) + 1]
+    if len(future) < int(horizon):
+        return []
+    prev_dt = _directional_row_time(items[idx])
+    for item in future:
+        cur_dt = _directional_row_time(item)
+        gap_hours = (cur_dt - prev_dt).total_seconds() / 3600.0
+        if gap_hours < -0.001 or gap_hours > DIRECTIONAL_MAX_SEQUENCE_GAP_HOURS:
+            return []
+        prev_dt = cur_dt
+    return future
+
+
 def _directional_raw_rows() -> Dict[str, List[Any]]:
     init_db()
     with get_conn() as conn:
@@ -24428,13 +24470,15 @@ def _directional_raw_rows() -> Dict[str, List[Any]]:
                    forward_test_candidate, take_trade, raw_json
             FROM raw_signals
             WHERE UPPER(pair) IN ('BCOUSD','BCO','UKOIL','BRENT','NIKKEI','JP225','JPN225')
-            ORDER BY UPPER(pair) ASC, id ASC
+            ORDER BY UPPER(pair) ASC, received_at_utc ASC, id ASC
         """).fetchall()
     by_asset: Dict[str, List[Any]] = {"BCOUSD": [], "NIKKEI": []}
     for row in rows:
         a = _hub_norm_asset(row["pair"])
         if a in by_asset:
             by_asset[a].append(row)
+    for asset in by_asset:
+        by_asset[asset].sort(key=_directional_row_time)
     return by_asset
 
 
@@ -24477,7 +24521,7 @@ def build_directional_signal_outcomes(limit: int = 100000) -> List[Dict[str, Any
                     d[f"stop_hit_{h}h"] = 0
                     if entry is None or entry == 0:
                         continue
-                    future = items[idx + 1: idx + h + 1]
+                    future = _directional_future_window(items, idx, h)
                     if len(future) < h:
                         continue
                     target = safe_float(future[-1]["exec_close"])
@@ -24552,7 +24596,7 @@ def build_directional_candidate_context_outcomes(limit: int = 200000) -> List[Di
                         d[f"stop_hit_{h}h"] = 0
                         if entry is None or entry == 0:
                             continue
-                        future = items[idx + 1: idx + h + 1]
+                        future = _directional_future_window(items, idx, h)
                         if len(future) < h:
                             continue
                         target = safe_float(future[-1]["exec_close"])
